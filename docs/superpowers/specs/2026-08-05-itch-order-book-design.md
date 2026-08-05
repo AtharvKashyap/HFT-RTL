@@ -48,7 +48,7 @@ and message structs live in a common package (`book_pkg`).
 
 ### Module 1: `mold_framer`
 
-- Input: raw byte stream (AXI-Stream, width parameterizable, start at 8 bytes/cycle).
+- Input: raw byte stream (AXI-Stream, width parameterizable; v1 implements 1 byte/cycle — ample for simulation, widening is a phase-2 item).
 - Unwraps MoldUDP64: session (10B), sequence number (8B), message count (2B),
   then length-prefixed messages.
 - Checks sequence continuity; on a gap, asserts a sticky `gap_detected` status
