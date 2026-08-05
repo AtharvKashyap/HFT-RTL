@@ -95,13 +95,18 @@ class MarketModel:
         # DecodedMsg.symbol keeps its 8-char space padding (see model/itch.py);
         # normalize configured symbols the same way so lookups match.
         self.books = {sym.ljust(8): PriceBook(n_levels) for sym in symbols}
+        self.symbol_to_idx = {sym.ljust(8): i for i, sym in enumerate(symbols)}
         # order_id -> [symbol, side, price, shares]
         self.orders = {}
         self.drop_count = 0
 
     def _snapshot_event(self, symbol: str) -> dict:
         snap = self.books[symbol].snapshot()
-        return {"symbol_idx": symbol, "bid": snap["bid"], "ask": snap["ask"]}
+        return {
+            "symbol_idx": self.symbol_to_idx[symbol],
+            "bid": snap["bid"],
+            "ask": snap["ask"],
+        }
 
     def on_message(self, msg: DecodedMsg) -> list:
         events = []

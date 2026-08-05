@@ -126,6 +126,14 @@ def test_exec_reduces_at_resting_price():
     assert ev[0]["bid"][0] == (1805000, 60)
 
 
+def test_snapshot_event_symbol_idx_is_numeric_index_of_configured_symbol():
+    m = MarketModel(["AAPL", "MSFT"])
+    ev = m.on_message(_add(1, "MSFT", "B", 100, 1805000))
+    assert ev[0]["symbol_idx"] == 1
+    ev2 = m.on_message(_add(2, "AAPL", "B", 50, 1000000))
+    assert ev2[0]["symbol_idx"] == 0
+
+
 def test_delete_removes_remaining_shares():
     m = MarketModel(["AAPL"])
     m.on_message(_add(1, "AAPL", "B", 100, 1805000))
