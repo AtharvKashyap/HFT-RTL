@@ -67,3 +67,52 @@ def test_dump_trace_synthetic_capture(tmp_path):
     fourth = json.loads(lines[3])
     assert fourth["n"] == 4  # ordinal counts the unknown message too
     assert fourth["bid"][0] == [0, 0]  # AAPL bid removed by delete
+
+
+def test_dump_trace_wrap_out_matches_consumed_messages(tmp_path):
+    """--wrap-out must reproduce exactly the messages the model consumed, in order.
+
+    This is the guarantee the RTL replay harness relies on: the ordinal `n` in
+    the golden trace indexes the same message the DUT sees at that position in
+    the wrapped stream.
+    """
+    from model.tests.test_moldwrap import parse_stream
+
+    messages = [
+        _add(1, 'B', 100, 'AAPL    ', 1500000),
+        _add(2, 'S', 50, 'AAPL    ', 1510000),
+        _add(3, 'B', 200, 'MSFT    ', 3000000),
+        b'Z' + b'\x00' * 10,   # unknown type: still part of the byte stream
+        _delete(1),
+    ]
+    capture = tmp_path / "synthetic.bin"
+    capture.write_bytes(b''.join(_record(m) for m in messages))
+
+    out_path = tmp_path / "trace.jsonl"
+    wrap_path = tmp_path / "stream.mold"
+    summary = dump_trace(str(capture), ["AAPL", "MSFT"], str(out_path),
+                         wrap_out=str(wrap_path), msgs_per_packet=2)
+
+    assert summary["wrapped_messages"] == 5
+    packets, parsed = parse_stream(wrap_path.read_bytes())
+    assert parsed == messages          # byte-identical, including the unknown 'Z'
+    assert packets[-1][2] == 0xFFFF    # end-of-session trailer present
+    # 5 messages at 2 per packet -> 2 full + 1 partial + trailer.
+    assert len(packets) == 4
+
+
+def test_dump_trace_wrap_out_respects_limit(tmp_path):
+    from model.tests.test_moldwrap import parse_stream
+
+    messages = [_add(i, 'B', 10 * i, 'AAPL    ', 1500000 + i) for i in range(1, 11)]
+    capture = tmp_path / "synthetic.bin"
+    capture.write_bytes(b''.join(_record(m) for m in messages))
+
+    wrap_path = tmp_path / "stream.mold"
+    summary = dump_trace(str(capture), ["AAPL"], str(tmp_path / "trace.jsonl"),
+                         limit=4, wrap_out=str(wrap_path))
+
+    assert summary["messages"] == 4
+    assert summary["wrapped_messages"] == 4
+    _, parsed = parse_stream(wrap_path.read_bytes())
+    assert parsed == messages[:4]

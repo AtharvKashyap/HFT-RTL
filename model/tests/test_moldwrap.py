@@ -2,7 +2,30 @@
 
 import struct
 
-from model.moldwrap import wrap
+from model.moldwrap import MoldWriter, wrap
+
+
+def parse_stream(data: bytes):
+    """Walk a concatenated MoldUDP64 byte stream, returning (packets, messages).
+
+    This is the reader the RTL framer implements in hardware; using it on the
+    bytes `--wrap-out` produced is what proves the harness input is well formed.
+    """
+    packets = []
+    messages = []
+    offset = 0
+    while offset < len(data):
+        session, sequence, count = struct.unpack('>10sQH', data[offset:offset + 20])
+        offset += 20
+        pkt_msgs = []
+        for _ in range(count if count not in (0x0000, 0xFFFF) else 0):
+            (length,) = struct.unpack('>H', data[offset:offset + 2])
+            offset += 2
+            pkt_msgs.append(data[offset:offset + length])
+            offset += length
+        packets.append((session, sequence, count))
+        messages.extend(pkt_msgs)
+    return packets, messages
 
 
 def _parse_packet(packet: bytes):
@@ -80,3 +103,48 @@ def test_wrap_session_padded_or_truncated_to_10_bytes():
     packets = list(wrap([b'x'], session=b'SESSION001', msgs_per_packet=4))
     session, _, _, _ = _parse_packet(packets[0])
     assert len(session) == 10
+
+
+def test_mold_writer_stream_round_trips(tmp_path):
+    messages = [bytes([0x41]) + bytes(i % 256 for i in range(30 + (i % 5)))
+                for i in range(37)]
+    path = tmp_path / "stream.mold"
+    with open(path, 'wb') as f:
+        writer = MoldWriter(f, session=b'SESSION001', msgs_per_packet=8)
+        for m in messages:
+            writer.add(m)
+        writer.close()
+
+    packets, parsed = parse_stream(path.read_bytes())
+
+    # Every message comes back byte-identical, in order.
+    assert parsed == messages
+    assert writer.messages == len(messages)
+    # 37 messages / 8 = 4 full + 1 partial + 1 end-of-session trailer.
+    assert len(packets) == 6
+    assert writer.packets == 6
+    assert packets[-1][2] == 0xFFFF
+
+    # Sequence numbers advance by the message count of each data packet, which
+    # is what mold_framer's gap detector predicts.
+    counts = [c for _, _, c in packets[:-1]]
+    seqs = [s for _, s, _ in packets]
+    expected = 1
+    for i, c in enumerate(counts):
+        assert seqs[i] == expected
+        expected += c
+    assert seqs[-1] == expected  # end-of-session packet carries the next sequence
+
+
+def test_mold_writer_matches_wrap_bytes(tmp_path):
+    """MoldWriter and wrap() must produce identical bytes for the same input."""
+    messages = [f"msg{i}".encode() for i in range(10)]
+    path = tmp_path / "stream.mold"
+    with open(path, 'wb') as f:
+        writer = MoldWriter(f, session=b'SESSION001', msgs_per_packet=4)
+        for m in messages:
+            writer.add(m)
+        writer.close()
+
+    assert path.read_bytes() == b''.join(wrap(messages, session=b'SESSION001',
+                                              msgs_per_packet=4))

@@ -22,6 +22,53 @@ def _pack_packet(session: bytes, sequence: int, messages: list) -> bytes:
     return _HDR.pack(session, sequence, count) + body
 
 
+def end_of_session_packet(session: bytes, sequence: int) -> bytes:
+    """The count==0xFFFF trailer packet (carries no messages)."""
+    return _HDR.pack(session[:10].ljust(10, b'\x00'), sequence, 0xFFFF)
+
+
+class MoldWriter:
+    """Incremental MoldUDP64 writer over a binary file object.
+
+    Same packet layout and sequence arithmetic as `wrap()` (which is a
+    generator and therefore awkward to drive from a loop that is also doing
+    other work with each message). `model/dump_trace.py --wrap-out` uses this
+    to emit the byte stream for the RTL replay harness while simultaneously
+    feeding the same messages to the Python model, guaranteeing the two
+    consume a byte-identical message sequence.
+    """
+
+    def __init__(self, fileobj, session: bytes = b'SESSION001',
+                 msgs_per_packet: int = 16, start_seq: int = 1):
+        self.f = fileobj
+        self.session = session[:10].ljust(10, b'\x00')
+        self.msgs_per_packet = msgs_per_packet
+        self.seq = start_seq
+        self._batch = []
+        self.packets = 0
+        self.messages = 0
+
+    def _flush(self):
+        if not self._batch:
+            return
+        self.f.write(_pack_packet(self.session, self.seq, self._batch))
+        self.seq += len(self._batch)
+        self.packets += 1
+        self._batch = []
+
+    def add(self, msg: bytes):
+        self._batch.append(msg)
+        self.messages += 1
+        if len(self._batch) == self.msgs_per_packet:
+            self._flush()
+
+    def close(self):
+        """Flush the partial packet and append the end-of-session packet."""
+        self._flush()
+        self.f.write(end_of_session_packet(self.session, self.seq))
+        self.packets += 1
+
+
 def wrap(messages: Iterable[bytes], session: bytes = b'SESSION001',
          msgs_per_packet: int = 4, start_seq: int = 1,
          gap_after: int | None = None) -> Iterator[bytes]:
