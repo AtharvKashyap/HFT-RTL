@@ -367,6 +367,26 @@ module tb_price_book;
     idle(1);
     check_counts("reduce miss empty side");
 
+    // Zero-share ADD is legal upstream (itch_decoder does not filter it) and
+    // model/book.py inserts [price, 0] reporting changed=True, so the RTL must
+    // create the level, pulse upd_valid and keep running -- never $fatal.
+    // A later reduce at that price then removes it (Python's `<= 0 -> pop`).
+    do_reset();
+    do_op(OP_ADD, 1'b1, 700, 0, "zero-share add creates level");
+    idle(1);
+    if (upd.bid_price[0] !== 32'd700 || upd.bid_shares[0] !== 32'd0)
+      $fatal(1, "zero-share add: bid[0]=(%0d,%0d), expected (700,0)",
+             upd.bid_price[0], upd.bid_shares[0]);
+    // Sorting still works around the zero-share level.
+    do_op(OP_ADD, 1'b1, 800, 5, "add above zero-share level");
+    do_op(OP_REDUCE, 1'b1, 700, 1, "reduce removes zero-share level");
+    idle(1);
+    if (upd.bid_price[0] !== 32'd800 || upd.bid_shares[0] !== 32'd5 ||
+        upd.bid_price[1] !== 32'd0   || upd.bid_shares[1] !== 32'd0)
+      $fatal(1, "zero-share removal: bid[0]=(%0d,%0d) bid[1]=(%0d,%0d)",
+             upd.bid_price[0], upd.bid_shares[0], upd.bid_price[1], upd.bid_shares[1]);
+    check_counts("zero-share add/remove");
+
     // Ops on both sides interleaved, one per cycle with no idle gaps.
     do_reset();
     do_op(OP_ADD, 1'b1, 1804000, 100, "both a");

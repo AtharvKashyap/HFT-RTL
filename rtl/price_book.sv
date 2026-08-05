@@ -119,7 +119,10 @@ module price_book #(parameter logic [book_pkg::BOOK_IDX_W-1:0] MY_IDX = '0) (
     if (op_valid) begin
       if (op.op == OP_ADD) begin
         if (match_any) begin
-          // Existing price level: aggregate.
+          // Existing price level: aggregate. Unlike Python's unbounded int this
+          // wraps at 2^32; a wrapped-small total would then let the next reduce
+          // delete the level early. Unreachable at real ITCH share volumes, and
+          // guarding it would itself diverge from model/book.py.
           nxt_shares[match_idx] = cur_shares[match_idx] + op.shares;
           changed               = 1'b1;
         end else if (!cand_any) begin
@@ -259,10 +262,12 @@ module price_book #(parameter logic [book_pkg::BOOK_IDX_W-1:0] MY_IDX = '0) (
           $fatal(1, "price_book: invalid bid level %0d is not zeroed", i);
         if (!na_vld[i] && (na_price[i] != '0 || na_shares[i] != '0))
           $fatal(1, "price_book: invalid ask level %0d is not zeroed", i);
-        if (nb_vld[i] && nb_shares[i] == '0)
-          $fatal(1, "price_book: valid bid level %0d has zero shares", i);
-        if (na_vld[i] && na_shares[i] == '0)
-          $fatal(1, "price_book: valid ask level %0d has zero shares", i);
+        // A valid level with zero shares is deliberately NOT an error: ITCH can
+        // carry a zero-share add, itch_decoder passes it through unfiltered, and
+        // model/book.py's PriceBook inserts [price, 0] and reports changed. The
+        // RTL produces the identical state, and per the global "errors are never
+        // fatal" rule it must keep running. A subsequent reduce at that price
+        // removes the level (Python's `<= 0 -> pop`).
       end
     end
   end
