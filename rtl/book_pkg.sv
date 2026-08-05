@@ -1,7 +1,16 @@
 package book_pkg;
   parameter int NUM_SYMBOLS   = 16;
   parameter int N_LEVELS      = 8;
-  parameter int TABLE_ADDR_W  = 16;
+  // Resting-order table address width (book_router). 20 bits = 1,048,576 slots.
+  // Sized from the real capture: 13.6M messages of AAPL + MSFT alone peak at
+  // 42,190 simultaneously live orders, which overruns a 16-bit (65,536-slot)
+  // table at the open -- an 8-deep probe window starts failing, dropping ADDs
+  // and every follow-up message for them, which is a hard divergence from the
+  // Python model. At 20 bits the same feed never exhausts the probe window.
+  // Sim-first: 2^20 x ~137b is trivial for Verilator. A real board port would
+  // not store the full 64-bit order id per slot -- it would keep a hash tag and
+  // move the table to external memory (phase-2 concern).
+  parameter int TABLE_ADDR_W  = 20;
   parameter int MAX_PROBES    = 8;
   parameter int BOOK_IDX_W    = $clog2(NUM_SYMBOLS);
 

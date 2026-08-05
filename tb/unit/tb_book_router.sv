@@ -9,15 +9,23 @@
 // MarketModel.on_message order-ID table exactly (same free/keep decisions, same
 // drop accounting, same REPLACE reduce-then-add op pair).
 //
-// Both phases compare EVERY emitted op (op kind, book_idx, side, price, shares)
+// Phase 3 -- capacity: 120,000 messages that grow the table to ~45,000 live
+// entries (the real capture's AAPL+MSFT peak is 42,190) and then churn on top of
+// them, proving TABLE_ADDR_W is sized for the real feed and that accumulated
+// deletion tombstones never turn a live entry into a lookup miss.
+//
+// All phases compare EVERY emitted op (op kind, book_idx, side, price, shares)
 // against a FIFO of expected ops, and cross-check drop_count /
 // table_full_count / occupancy.
 //
-// Timing contract under test: the DUT accepts a message presented with
-// in_valid while !busy, then runs a multi-cycle probe FSM. Ops appear as
-// registered one-cycle out_valid pulses, so REPLACE's REDUCE and ADD are
-// necessarily on different cycles (a single out_valid cannot carry two ops).
-// in_valid is never asserted while busy -- the DUT asserts on that.
+// Timing contract under test: the DUT accepts a table-touching message presented
+// with in_valid while !busy, then runs a multi-cycle probe FSM; a separate
+// checker fails if one message ever keeps it busy for more than 19 cycles. Ops
+// appear as registered one-cycle out_valid pulses, so REPLACE's REDUCE and ADD
+// are necessarily on different cycles (a single out_valid cannot carry two ops).
+// MSG_SYSTEM is the exception and is deliberately driven WHILE busy in one
+// directed case: a 12-byte System Event leaves only 14 idle cycles behind it, so
+// the DUT must absorb it without disturbing the message in flight.
 //
 // Inputs are driven and outputs sampled on the falling edge; timescale comes
 // from the Makefile (--timescale 1ns/1ps).
@@ -34,6 +42,13 @@ module tb_book_router;
   localparam logic [63:0] SYM_MSFT = "MSFT    ";
   localparam logic [63:0] SYM_GOOG = "GOOG    ";   // untracked
   localparam logic [63:0] SYM_TSLA = "TSLA    ";   // untracked
+
+  // Three independent hash chains for the collision / table-full cases. Their
+  // folds are 0x1000 / 0x2000 / 0x3000 for any TABLE_ADDR_W >= 14, i.e. far
+  // enough apart that the chains never overlap (checked at run time below).
+  localparam logic [63:0] BASE_A = 64'h0000_0000_0000_1000;
+  localparam logic [63:0] BASE_B = 64'h0000_0000_0000_2000;
+  localparam logic [63:0] BASE_C = 64'h0000_0000_0000_3000;
 
   logic         clk;
   logic         rst_n = 1'b0;
@@ -331,16 +346,18 @@ module tb_book_router;
     return h;
   endfunction
 
-  // Order id whose fold is `want`: two 16-bit chunks that XOR to it.
-  // (TABLE_ADDR_W is 16, so {0, 0, k, k ^ want} folds to `want` for any k.)
-  function automatic logic [63:0] colliding_id(logic [15:0] k, logic [15:0] want);
-    return {32'd0, k, k ^ want};
+  // Distinct order ids that all fold to the same slot as `base`, for ANY
+  // TABLE_ADDR_W (as long as 2*TABLE_ADDR_W <= 64, checked below). The XOR-fold
+  // is linear over GF(2), and (c << TABLE_ADDR_W) ^ c folds to c ^ c = 0, so
+  // XOR-ing it into `base` leaves the fold untouched while changing the id.
+  // Injective in c for c < 2**TABLE_ADDR_W, so distinct c give distinct ids.
+  function automatic logic [63:0] collider(logic [63:0] base, int c);
+    return base ^ ((64'(c) << TABLE_ADDR_W) ^ 64'(c));
   endfunction
 
   // ------------------------------------------------------------- test body
   logic [63:0] ids  [16];
   int          occ;
-  int          live_n;
   int          pick;
   int          r;
   longint unsigned live [$];
@@ -348,12 +365,25 @@ module tb_book_router;
   decoded_msg_t    m;
   logic [31:0]     px, sh;
   int              tracked_adds;
+  int              peak_live;
 
   initial begin
     in_msg   = '0;
     ops_seen = 0;
     msg_num  = 0;
     next_id  = 64'd1;
+
+    // The collider() construction needs two disjoint fold chunks, and the three
+    // bases must be far enough apart that their probe windows cannot overlap.
+    if (2 * TABLE_ADDR_W > 64)
+      $fatal(1, "collider() needs 2*TABLE_ADDR_W <= 64, got %0d", TABLE_ADDR_W);
+    if (fold(BASE_A) == fold(BASE_B) || fold(BASE_B) == fold(BASE_C) ||
+        fold(BASE_A) == fold(BASE_C))
+      $fatal(1, "collision bases share a fold (%h %h %h)",
+             fold(BASE_A), fold(BASE_B), fold(BASE_C));
+    if (fold(BASE_B) - fold(BASE_A) < TABLE_ADDR_W'(MAX_PROBES + 2) ||
+        fold(BASE_C) - fold(BASE_B) < TABLE_ADDR_W'(MAX_PROBES + 2))
+      $fatal(1, "collision bases are too close together");
 
     // ---------------------------------------------------------- directed
     do_reset();
@@ -436,7 +466,16 @@ module tb_book_router;
          "add for replace");
     occ++;
     send(mk(MSG_EXEC, 64'd120, 64'd0, 1'b0, 32'd100, 32'd0, 64'd0), "partial before replace");
-    // note: shares/price of a REPLACE come from the message; side is inherited.
+    // Deliberately dirty the DUT's "last ADD" side/book_idx registers with the
+    // OPPOSITE side and a DIFFERENT symbol, so the REPLACE below can only
+    // produce the right book_idx/side by genuinely inheriting them from the
+    // entry it looked up -- reusing stale registers or the message's own side
+    // field both give a visibly wrong op.
+    send(mk(MSG_ADD, 64'd130, 64'd0, 1'b1, 32'd7, 32'd1015000, SYM_AAPL),
+         "add to dirty side/idx registers");
+    occ++;
+    // Note: shares/price of a REPLACE come from the message; side/idx inherited.
+    // Message side is 1 while the replaced entry (order 120, MSFT) is side 0.
     send(mk(MSG_REPLACE, 64'd120, 64'd121, 1'b1, 32'd400, 32'd1030000, 64'd0),
          "replace 120 -> 121");
     check_counts("replace");
@@ -445,6 +484,8 @@ module tb_book_router;
     send(mk(MSG_EXEC, 64'd121, 64'd0, 1'b0, 32'd400, 32'd0, 64'd0), "exec replaced id");
     occ--;
     send(mk(MSG_EXEC, 64'd120, 64'd0, 1'b0, 32'd1, 32'd0, 64'd0), "exec stale id");
+    send(mk(MSG_DELETE, 64'd130, 64'd0, 1'b0, 32'd0, 32'd0, 64'd0), "delete dirtying add");
+    occ--;
     check_counts("post-replace");
     check_occupancy("post-replace", occ);
 
@@ -456,8 +497,8 @@ module tb_book_router;
 
     // Hash collisions: two ids that fold to the same slot must both be
     // insertable and both resolvable through linear probing.
-    ids[0] = colliding_id(16'h1000, 16'h1234);
-    ids[1] = colliding_id(16'h1001, 16'h1234);
+    ids[0] = collider(BASE_A, 1);
+    ids[1] = collider(BASE_A, 2);
     if (fold(ids[0]) !== fold(ids[1]))
       $fatal(1, "crafted ids do not collide: %h vs %h", fold(ids[0]), fold(ids[1]));
     if (ids[0] === ids[1]) $fatal(1, "crafted colliding ids are identical");
@@ -478,9 +519,11 @@ module tb_book_router;
     // sits at the second slot of its chain, and the new id folds to the same
     // chain (so the insert probes past the surviving entry and the tombstone
     // the freed old entry leaves behind).
-    ids[2] = colliding_id(16'h3000, 16'h7777);
-    ids[3] = colliding_id(16'h3001, 16'h7777);
-    ids[4] = colliding_id(16'h3002, 16'h7777);
+    ids[2] = collider(BASE_B, 1);
+    ids[3] = collider(BASE_B, 2);
+    ids[4] = collider(BASE_B, 3);
+    if (fold(ids[2]) !== fold(ids[3]) || fold(ids[3]) !== fold(ids[4]))
+      $fatal(1, "probing-replace ids do not collide");
     send(mk(MSG_ADD, ids[2], 64'd0, 1'b1, 32'd33, 32'd1080000, SYM_AAPL),
          "probing replace: add first");
     occ++;
@@ -499,10 +542,48 @@ module tb_book_router;
     check_counts("probing replace");
     check_occupancy("probing replace done", occ);
 
+    // A SYSTEM message arriving WHILE the DUT is busy must be absorbed without
+    // disturbing the message in flight and without tripping the DUT's
+    // in_valid-while-busy assertion. This is not hypothetical: the framer leaves
+    // only msg_len+2 = 14 idle cycles after a 12-byte 'S' System Event, which a
+    // worst-case REPLACE (16 busy cycles) can still be occupying.
+    send(mk(MSG_ADD, 64'd140, 64'd0, 1'b0, 32'd60, 32'd1110000, SYM_MSFT),
+         "system-during-busy: setup add");
+    occ++;
+    m = mk(MSG_REPLACE, 64'd140, 64'd141, 1'b1, 32'd70, 32'd1120000, 64'd0);
+    msg_num++;
+    model_msg(m, "system-during-busy: replace");
+    while (busy) @(negedge clk);
+    in_msg   = m;
+    in_valid = 1'b1;
+    @(posedge clk);
+    @(negedge clk);
+    if (!busy) $fatal(1, "DUT not busy after accepting a REPLACE");
+    // Hold a SYSTEM message on the input for the whole busy window.
+    in_msg = mk(MSG_SYSTEM, 64'd0, 64'd0, 1'b0, 32'd0, 32'd0, 64'd0);
+    while (busy) begin
+      in_valid = 1'b1;
+      @(posedge clk);
+      @(negedge clk);
+    end
+    in_valid = 1'b0;
+    in_msg   = '0;
+    repeat (3) @(negedge clk);
+    check_counts("system during busy");     // both REPLACE ops emitted intact
+    check_occupancy("system during busy", occ);
+    // The replaced order is live at its new id, so the FSM was not corrupted.
+    send(mk(MSG_EXEC, 64'd141, 64'd0, 1'b0, 32'd70, 32'd0, 64'd0),
+         "system-during-busy: exec new id");
+    occ--;
+    check_counts("system during busy done");
+    check_occupancy("system during busy done", occ);
+
     // Fill the whole probe window with colliding ids, then one more: the extra
     // ADD is dropped and counted as table-full (not as a drop).
     for (int i = 0; i < MAX_PROBES; i++) begin
-      ids[i] = colliding_id(16'(16'h2000 + i), 16'h4321);
+      ids[i] = collider(BASE_C, i + 1);
+      if (fold(ids[i]) !== fold(BASE_C))
+        $fatal(1, "table-full id %0d does not collide", i);
       send(mk(MSG_ADD, ids[i], 64'd0, 1'b1, 32'(10 + i), 32'd1060000, SYM_AAPL),
            $sformatf("fill probe window %0d", i));
       occ++;
@@ -511,7 +592,7 @@ module tb_book_router;
     check_occupancy("probe window filled", occ);
 
     // One more colliding id: no op, table_full_count++, no insert.
-    ids[8] = colliding_id(16'h20FF, 16'h4321);
+    ids[8] = collider(BASE_C, MAX_PROBES + 1);
     msg_num++;
     send_raw(mk(MSG_ADD, ids[8], 64'd0, 1'b1, 32'd77, 32'd1070000, SYM_AAPL));
     ref_full++;
@@ -633,6 +714,66 @@ module tb_book_router;
 
     $display("  random phase: ok (%0d messages, %0d ops total, drop=%0d, occupancy=%0d)",
              msg_num, ops_seen, drop_count, occupancy);
+
+    // ------------------------------------------------------------ capacity
+    // TABLE_ADDR_W is sized for the real capture, whose AAPL+MSFT order flow
+    // peaks at 42,190 simultaneously live orders. This phase reproduces that
+    // pressure -- grow to ~45,000 live entries, then churn 75,000 more messages
+    // so tombstones accumulate on top of them -- and requires that NOTHING
+    // degrades: no table-full ADD drops, no lookup ever mistaking a tombstoned
+    // probe chain for a miss (drop_count must still match the scoreboard, which
+    // knows nothing about probe geometry), and occupancy exactly equal to the
+    // live-entry count. Deliberately runs on top of the random phase's leftover
+    // state rather than resetting, to avoid a second 2**TABLE_ADDR_W clear sweep.
+    peak_live = 0;
+    for (int n = 0; n < 45000; n++) begin
+      oid = {32'($urandom()), 32'(next_id)};
+      next_id++;
+      send(mk(MSG_ADD, oid, 64'd0, 1'($urandom_range(1, 0)),
+              32'(1 + $urandom_range(499, 0)),
+              32'((90 + $urandom_range(20, 0)) * 10000),
+              ($urandom_range(1, 0) == 0) ? SYM_AAPL : SYM_MSFT),
+           "capacity add", 0);
+      live.push_back(oid);
+      if (live.size() > peak_live) peak_live = live.size();
+    end
+    check_counts("capacity fill");
+    check_occupancy("capacity fill", sb_idx.num());
+
+    for (int n = 0; n < 75000; n++) begin
+      if ($urandom_range(1, 0) == 0) begin
+        oid = {32'($urandom()), 32'(next_id)};
+        next_id++;
+        send(mk(MSG_ADD, oid, 64'd0, 1'($urandom_range(1, 0)),
+                32'(1 + $urandom_range(499, 0)),
+                32'((90 + $urandom_range(20, 0)) * 10000),
+                ($urandom_range(1, 0) == 0) ? SYM_AAPL : SYM_MSFT),
+             "capacity churn add", 0);
+        live.push_back(oid);
+        if (live.size() > peak_live) peak_live = live.size();
+      end else begin
+        pick = $urandom_range(live.size() - 1, 0);
+        oid  = live[pick];
+        send(mk(MSG_DELETE, oid, 64'd0, 1'b0, 32'd0, 32'd0, 64'd0),
+             "capacity churn delete", 0);
+        // Unordered removal: order in `live` is irrelevant and this keeps the
+        // churn loop O(1) per message instead of O(live.size()).
+        live[pick] = live[live.size()-1];
+        void'(live.pop_back());
+      end
+    end
+
+    repeat (4) @(negedge clk);
+    check_counts("capacity phase");
+    if (table_full_count !== 32'd0)
+      $fatal(1, "capacity phase hit table_full_count=%0d (peak live %0d in %0d slots)",
+             table_full_count, peak_live, 1 << TABLE_ADDR_W);
+    check_occupancy("capacity phase", sb_idx.num());
+    if (live.size() != sb_idx.num())
+      $fatal(1, "live queue (%0d) out of step with scoreboard (%0d)",
+             live.size(), sb_idx.num());
+    $display("  capacity phase: ok (120000 messages, peak live %0d of %0d slots, drop=%0d, occupancy=%0d)",
+             peak_live, 1 << TABLE_ADDR_W, drop_count, occupancy);
 
     $display("PASS");
     $finish;

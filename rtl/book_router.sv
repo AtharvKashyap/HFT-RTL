@@ -37,12 +37,26 @@
 // has no holes, a re-added id updates its entry rather than growing occupancy.
 // Real feeds never reuse a live id, so this is a robustness path only.
 //
-// Timing: one message at a time. The FSM raises `busy` from the cycle after a
-// message is accepted until it is done; the byte-wide upstream guarantees at
-// least 19 idle cycles between messages, which covers the worst case (a REPLACE
-// probing MAX_PROBES twice). An assertion catches any violation in simulation.
+// Timing: one table-touching message at a time. The FSM raises `busy` from the
+// cycle after a message is accepted until it is done. The worst case is 16 busy
+// cycles (a REPLACE probing MAX_PROBES for the lookup and again for the insert),
+// and the byte-wide upstream leaves msg_len+2 idle cycles after a message, i.e.
+// >= 19 for every message kind that reaches the table (the shortest is the
+// 19-byte 'D' Delete). An assertion catches any violation in simulation.
+//
+// MSG_SYSTEM is the one exception and is accepted UNCONDITIONALLY, even while
+// busy: a 12-byte 'S' System Event leaves only 14 idle cycles behind it, which a
+// worst-case REPLACE can still be occupying. That is safe precisely because
+// SYSTEM touches nothing -- no table access, no op, no counter, no latched
+// state -- so it needs no FSM cycle and cannot disturb a message in flight. The
+// busy assertion is therefore scoped to non-SYSTEM messages.
+//
 // After reset the table is cleared by a sweep that writes every entry once, so
-// `busy` stays high for 1<<TABLE_ADDR_W cycles before the first message.
+// `busy` stays high for 1<<TABLE_ADDR_W cycles before the first message can be
+// accepted. INTEGRATION REQUIREMENT: this interface has no backpressure, so the
+// top level must hold the byte feed into itch_decoder (or its reset) until
+// `busy` falls after reset -- otherwise the first messages of the session are
+// silently lost.
 //
 // out_op/out_valid are registered: out_valid is a one-cycle pulse and out_op is
 // stable for that whole cycle, which is exactly the one-op-per-cycle interface
@@ -212,7 +226,9 @@ module book_router #(
 
       // -------------------------------------------------------------- idle
       S_IDLE: begin
-        if (in_valid) begin
+        // MSG_SYSTEM is deliberately not even latched: it does nothing, in any
+        // state, which is what makes accepting it while busy safe.
+        if (in_valid && (in_msg.kind != MSG_SYSTEM)) begin
           kind_d   = in_msg.kind;
           oid_d    = in_msg.order_id;
           shares_d = in_msg.shares;
@@ -238,7 +254,7 @@ module book_router #(
               addr_d   = hash_fold(in_msg.order_id);
               state_d  = S_LOOK;
             end
-            default: ;                         // MSG_SYSTEM: nothing
+            default: ;                         // filtered out above
           endcase
         end
       end
@@ -375,11 +391,15 @@ module book_router #(
 `ifndef SYNTHESIS
   always_ff @(posedge clk) begin
     if (rst_n) begin
-      // The byte-wide upstream guarantees >= 19 idle cycles between messages,
-      // which is more than the worst-case FSM run, so a message arriving while
-      // busy means the contract was broken (or reset was released too late).
-      if (in_valid && busy)
-        $fatal(1, "book_router: in_valid asserted while busy (state %0d)", state_q);
+      // The byte-wide upstream leaves >= 19 idle cycles after every message that
+      // reaches the table, which is more than the worst-case FSM run, so such a
+      // message arriving while busy means the contract was broken (or the byte
+      // feed was not gated until the post-reset clear sweep finished). SYSTEM
+      // messages are exempt: their gap is only 14 cycles and they are accepted
+      // unconditionally because they touch nothing.
+      if (in_valid && busy && (in_msg.kind != MSG_SYSTEM))
+        $fatal(1, "book_router: in_valid asserted while busy (state %0d, kind %0d)",
+               state_q, in_msg.kind);
       if (occ_inc && occ_dec)
         $fatal(1, "book_router: occupancy incremented and decremented at once");
       if (occ_dec && occupancy == 32'd0)
