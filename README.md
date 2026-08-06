@@ -1,4 +1,6 @@
-# Hardware ITCH Order Book
+# rtlbook
+
+A limit order book in SystemVerilog.
 
 Synthesizable SystemVerilog that consumes a Nasdaq TotalView-ITCH 5.0 feed one
 byte per cycle and maintains live top-8 price-level books for 16 symbols:
