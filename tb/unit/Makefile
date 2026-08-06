@@ -14,7 +14,7 @@ VFLAGS := --binary --timing --timescale 1ns/1ps -Wall \
           -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM
 
 # Verilator's generated makefile cannot build in a directory whose path contains
-# spaces, and this repo lives under ".../Claude projects/...", so build out of tree.
+# spaces, which a checkout path may well contain, so build out of tree.
 BUILD_DIR ?= /tmp/fpga_proj_vbuild/$(TOP)
 
 run:

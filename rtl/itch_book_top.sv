@@ -45,7 +45,7 @@ module itch_book_top #(
   output logic [31:0] gap_count, malformed_count, unknown_count,
   output logic [31:0] drop_count, table_full_count,
   output logic        end_of_session,
-  // extras for the replay harness (task 9)
+  // extras for the replay harness
   output logic        msg_boundary,
   output logic [31:0] reduce_miss_count,
   output logic [31:0] evict_count

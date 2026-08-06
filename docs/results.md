@@ -110,8 +110,8 @@ so more cycles do book work rather than being filtered away.
 Compiling the generated model at `-O3` instead of Verilator's `-Os` default made
 no useful difference — measured over the same 1M-message rung, `-Os` ran the first
 1M messages in 29.4 s and `-O3` in 28.7-28.8 s, inside run-to-run noise. The
-`-O3` build is kept because the brief asks for it and it is what the recorded
-numbers above were produced with, but it is not a speed lever: the model is
+`-O3` build is kept because it is what the recorded numbers above were
+produced with, but it is not a speed lever: the model is
 memory-bound on the order table, not compute-bound. (An earlier 22.8 s figure for
 a standalone 1M run reflected a warm page cache, not the compiler flag.)
 
@@ -223,7 +223,7 @@ treating it as fatal, and not evidence that the fuzzer found anything.
 run confirms the tail is not just passed through as bytes but actually
 decoded, routed, and reaches a price book again.
 
-A prior review of `itch_decoder` (Task 4) flagged that its write-index clamp
+An earlier review of `itch_decoder` flagged that its write-index clamp
 for oversized messages (`widx` forced to 0 once `byte_cnt >= 40`) could in
 principle let an oversized message corrupt `msg_buf[0]`, and this fuzz's
 bogus lengths (up to 50 bytes) are exactly the kind of input that would
@@ -252,8 +252,7 @@ of {ADD-new-level, ADD-aggregate, ADD-evict-9th, ADD-reject-full,
 REDUCE-partial, REDUCE-remove, REDUCE-miss} × {bid, ask} to be hit, and
 `tb_book_router` all 10 bins of {ADD, EXEC, CANCEL, DELETE, REPLACE} ×
 {hit, miss} (for ADD: tracked / untracked). An empty bin is a `$fatal`, not a
-warning. See "Deviations from the spec" in
-[`docs/superpowers/specs/2026-08-05-itch-order-book-design.md`](superpowers/specs/2026-08-05-itch-order-book-design.md).
+warning.
 
 ## Reproducing
 

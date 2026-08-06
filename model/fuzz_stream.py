@@ -36,8 +36,8 @@ absorb (sticky counter, resynchronizes off the received sequence -- see
 rtl/mold_framer.sv). What is under test is exactly this: a hard sequence
 discontinuity plus a burst of nonsense messages beforehand does not stop the
 pipeline from decoding and applying whatever comes after correctly. State
-equality with a clean-only run is explicitly out of scope (see the task
-brief): the claim is liveness and continued correct operation on new input,
+equality with a clean-only run is explicitly out of scope: the claim is
+liveness and continued correct operation on new input,
 not recovery of the same book state that a clean run would have reached.
 
 No inter-packet garbage is ever injected, and no byte is ever inserted: every

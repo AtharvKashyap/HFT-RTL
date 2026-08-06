@@ -25,7 +25,7 @@ RTL := ../../rtl/book_pkg.sv \
 RTL_NAMES := $(addprefix rtl/,$(notdir $(RTL)))
 
 # Neither verilator nor the makefile it generates can cope with a source path
-# containing a space, and this repo lives under ".../Claude projects/...". So
+# containing a space, which a checkout path may well contain. So
 # the whole verilate+compile step runs INSIDE a space-free build directory:
 # the RTL directory is symlinked in as `rtl/`, the two local sources are copied
 # in, and verilator is invoked with cwd = BUILD_DIR and only relative paths.

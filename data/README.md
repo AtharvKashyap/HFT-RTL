@@ -24,7 +24,7 @@ present at that time (name, date, size):
 The listing also contains other, non-`*.NASDAQ_ITCH50.gz`-named full ITCH50
 captures (e.g. `itch50_05_15.gz`, `S071321-v50.txt.gz`) and an `NOII/`
 subdirectory (net-order-imbalance-indicator captures only, not general order
-flow) — these were not chosen because the task calls for the smallest file
+flow) — these were not chosen; the selection rule was the smallest file
 matching the `*.NASDAQ_ITCH50.gz` naming.
 
 Chosen: **12302019.NASDAQ_ITCH50.gz** (smallest matching file, ~3.5 GB
