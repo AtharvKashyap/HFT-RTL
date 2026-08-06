@@ -183,3 +183,56 @@ always keeps consuming. No condition is fatal in hardware.
 - Measured per-message latency in cycles (target: ≤10 cycles ingress→update
   for non-shifting updates; document actuals).
 - Clean, documented repo a hiring manager can skim in 10 minutes.
+
+## Deviations from this spec (as shipped)
+
+This spec was written before implementation and was not rewritten during it.
+The list below is the complete set of places where the shipped design differs
+from the text above, so the spec can be read as a record of intent without
+being mistaken for a description of the code.
+
+### Functional coverage — hand-rolled tallies, not covergroups
+
+The verification plan asks for "constrained-random stimulus with functional
+coverage goals (message kind × book state cross)". SystemVerilog covergroups
+are not implemented by Verilator, which is this project's only simulator, so
+coverage is collected **procedurally** instead: plain integer bin arrays
+incremented inside the testbenches' existing reference models (which already
+classify every op and every message), with an all-bins-hit gate that `$fatal`s
+at the end of the random phase if any bin is zero. An uncovered case fails the
+run rather than showing up as a percentage nobody reads.
+
+Coverage lives in the unit TBs, at the op / message level, and the spec's
+single "message kind × book state" cross is realized as two tallies either side
+of the module boundary that separates order tracking from book state:
+
+- **`tb/unit/tb_price_book.sv`** (book state) — op outcome × side, 14 bins:
+  {ADD-new-level, ADD-aggregate, ADD-evict-9th, ADD-reject-full,
+  REDUCE-partial, REDUCE-remove, REDUCE-miss} × {bid, ask}.
+- **`tb/unit/tb_book_router.sv`** (message kind × order-table state) — 10 bins:
+  {ADD, EXEC, CANCEL, DELETE, REPLACE} × {hit, miss}, where for ADD the split
+  is tracked / untracked symbol (an untracked ADD never enters the table) and
+  for the other four it is order-id lookup hit / miss.
+
+Both were confirmed empirically to fill every bin with the shipped op mix; no
+bin is unreachable and none required loosening.
+
+### Structural and parameter deviations
+
+| Spec says | Shipped | Why |
+|---|---|---|
+| `TABLE_SIZE` default 2^16 live orders (Module 3) | `TABLE_ADDR_W = 22`, i.e. 2^22 = 4,194,304 slots | Not an occupancy problem but a *clustering* problem: near-sequential ITCH order ids XOR-fold to near-sequential slots and linear probing piles them into contiguous runs, so at 2^20 the 8-deep probe window overflowed on the real capture and permanently diverged. Extra address bits spread the runs out; a bigger probe window does not. Rationale and the measured sizing experiment are in the comment in `rtl/book_pkg.sv`. |
+| Module 3 = `symbol_filter` + `order_id_table` as separate modules | Merged into one module, `rtl/book_router.sv` | The two share a single FSM and one pass over the message: the symbol lookup decides whether the table insert happens at all. Splitting them would mean handing the filter result across a ready/valid boundary for no benefit. |
+| Module 5 status port exposes "table occupancy" | `occupancy` exists on `book_router` and is checked by `tb_book_router`, but is **not** brought out of `itch_book_top` | Nothing above the top level consumes it; the replay harness checks the drop/full counters instead. Re-exposing it is a one-line change if a control interface ever needs it. |
+| Module 1 input width "parameterizable" (`BYTES_PER_BEAT`) | 1 byte/cycle, hardwired; no such parameter exists | v1 was always specified as 1 byte/cycle and widening was flagged as a phase-2 item, but the parameter was never introduced even as a stub. The `mold_framer` datapath assumes single-byte beats throughout. |
+| Layer 3: latency = ingress (framer input) → egress | Latency (`lat`) is measured **`msg_boundary` → `upd_valid`** | The definition used, and the reason for it, are documented under "Latency" in `docs/results.md`: it isolates the decode → table-lookup → book-update pipeline and excludes the 1 byte/cycle message shift-in, which is a datapath-width property rather than a pipeline property. Ingress→egress would mostly measure message length. |
+
+### Robustness fuzz — scope actually verified
+
+The plan says the design "must drop and count, never hang or corrupt book
+state (checked by resuming clean replay after fuzz burst)". What
+`scripts/run_fuzz.sh` verifies is **liveness under corruption**: no hang,
+error counters move, and book updates resume from the clean tail. Book state
+after the burst is never compared against a reference, so "never corrupt book
+state" is *not* established — see "Fuzz robustness" in `docs/results.md` for
+the precise claim and its caveats.

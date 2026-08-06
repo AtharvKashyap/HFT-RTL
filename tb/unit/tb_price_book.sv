@@ -107,10 +107,58 @@ module tb_price_book;
     return w;
   endfunction
 
+  // ------------------------------------------------------ functional coverage
+  // Hand-rolled tallies rather than covergroups: Verilator does not implement
+  // SystemVerilog functional coverage, so the spec's "op kind x book state"
+  // cross is counted procedurally inside the reference model, which already
+  // decides which of these seven mutually exclusive outcomes each op is, and
+  // gated at the end of the random phase. Crossed with side, so a bug that
+  // only affects (say) ask-side eviction cannot hide behind bid-side hits.
+  typedef enum int {
+    COV_ADD_NEW,        // ADD created a level that did not exist
+    COV_ADD_AGG,        // ADD aggregated into an existing level
+    COV_ADD_EVICT,      // ADD onto a full side, better than worst -> evicts
+    COV_ADD_REJECT,     // ADD onto a full side, worse than worst -> dropped
+    COV_RED_PARTIAL,    // REDUCE left the level with shares remaining
+    COV_RED_REMOVE,     // REDUCE took the level to <= 0 -> removed
+    COV_RED_MISS,       // REDUCE at a price not in the retained window
+    COV_N
+  } cov_outcome_e;
+
+  int cov_bin [COV_N][2];   // [outcome][side], side index 1 = bid, 0 = ask
+  bit cov_on = 1'b0;        // only the random phase counts toward the gate
+
+  function automatic void cov_hit(cov_outcome_e o, bit side);
+    if (cov_on) cov_bin[int'(o)][int'(side)]++;
+  endfunction
+
+  // Fails if any bin of the cross is empty: an outcome the random stimulus
+  // never produced is an outcome this run did not verify.
+  function automatic void cov_check();
+    string names [COV_N] = '{"ADD-new-level", "ADD-aggregate", "ADD-evict-9th",
+                             "ADD-reject-full", "REDUCE-partial",
+                             "REDUCE-remove", "REDUCE-miss"};
+    int holes;
+    holes = 0;
+    $display("  coverage (op outcome x side):");
+    for (int o = 0; o < int'(COV_N); o++) begin
+      $display("    %-16s bid=%0d ask=%0d", names[o], cov_bin[o][1], cov_bin[o][0]);
+      for (int s = 0; s < 2; s++)
+        if (cov_bin[o][s] == 0) begin
+          $display("    COVERAGE HOLE: %s x %s never occurred",
+                   names[o], s == 1 ? "bid" : "ask");
+          holes++;
+        end
+    end
+    if (holes != 0)
+      $fatal(1, "random phase left %0d functional-coverage bin(s) empty", holes);
+  endfunction
+
   function automatic bit ref_add(bit side, int price, int shares);
     int n, worst;
     if (ref_sh.exists(ck(side, price))) begin
       ref_sh[ck(side, price)] += 64'(shares);
+      cov_hit(COV_ADD_AGG, side);
       return 1'b1;
     end
     n = ref_count(side);
@@ -118,6 +166,7 @@ module tb_price_book;
       worst = ref_worst(side);
       if (side ? (price < worst) : (price > worst)) begin
         ref_evict++;
+        cov_hit(COV_ADD_REJECT, side);
         return 1'b0;   // worse than a full book's worst -> drop the add
       end
     end
@@ -126,6 +175,9 @@ module tb_price_book;
       worst = ref_worst(side);
       ref_sh.delete(ck(side, worst));
       ref_evict++;
+      cov_hit(COV_ADD_EVICT, side);
+    end else begin
+      cov_hit(COV_ADD_NEW, side);
     end
     return 1'b1;
   endfunction
@@ -134,11 +186,17 @@ module tb_price_book;
     longint v;
     if (!ref_sh.exists(ck(side, price))) begin
       ref_miss++;
+      cov_hit(COV_RED_MISS, side);
       return 1'b0;
     end
     v = ref_sh[ck(side, price)] - 64'(shares);
-    if (v <= 0) ref_sh.delete(ck(side, price));
-    else        ref_sh[ck(side, price)] = v;
+    if (v <= 0) begin
+      ref_sh.delete(ck(side, price));
+      cov_hit(COV_RED_REMOVE, side);
+    end else begin
+      ref_sh[ck(side, price)] = v;
+      cov_hit(COV_RED_PARTIAL, side);
+    end
     return 1'b1;
   endfunction
 
@@ -411,6 +469,7 @@ module tb_price_book;
 
     // ------------------------------------------------------------ random
     do_reset();
+    cov_on = 1'b1;
     for (int n = 0; n < 10000; n++) begin
       r_op   = $urandom_range(1, 0);       // 0 = ADD, 1 = REDUCE
       r_side = $urandom_range(1, 0);
@@ -423,6 +482,7 @@ module tb_price_book;
     check_counts("random phase");
     $display("  random phase: ok (10000 ops, evict=%0d, reduce_miss=%0d, crossed=%0d)",
              evict_count, reduce_miss_count, crossed_count);
+    cov_check();
 
     $display("PASS");
     $finish;

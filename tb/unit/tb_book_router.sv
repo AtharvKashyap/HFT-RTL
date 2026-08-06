@@ -155,6 +155,63 @@ module tb_book_router;
     return -1;
   endfunction
 
+  // ------------------------------------------------------ functional coverage
+  // Hand-rolled tallies rather than covergroups: Verilator does not implement
+  // SystemVerilog functional coverage constructs, so the cross the spec asks
+  // for (message kind x table outcome) is counted procedurally in the same
+  // reference model that already classifies every message, and gated at the
+  // end of the random phase.
+  //
+  // Outcome index 1 = "hit", 0 = "miss", where for the four follow-up kinds
+  // that means the order-id lookup found / did not find an entry, and for ADD
+  // it means the symbol was tracked (so the insert happened) / untracked (so
+  // nothing entered the table). cov_add_tracked is the same ADD split kept
+  // under its own name because the spec names it separately.
+  // Indexed by int'(msg_kind_e) (a dense 0..5 enum) rather than by the enum
+  // type itself, so every bin exists from time zero and reads back as a real 0
+  // instead of an associative-array default.
+  int cov_kind_outcome [6][2];
+  int cov_add_tracked  [2];
+  bit cov_on = 1'b0;      // only the random phase counts toward the gate
+
+  function automatic void cov_hit(msg_kind_e k, bit outcome);
+    if (!cov_on) return;
+    cov_kind_outcome[int'(k)][int'(outcome)]++;
+    if (k == MSG_ADD) cov_add_tracked[int'(outcome)]++;
+  endfunction
+
+  // Fails if any bin of the cross is empty. An empty bin means the random
+  // stimulus never produced that situation, so a bug living there would have
+  // gone unnoticed -- the run is not entitled to call itself covered.
+  function automatic void cov_check();
+    string kinds [5] = '{"ADD", "EXEC", "CANCEL", "DELETE", "REPLACE"};
+    msg_kind_e ks [5] = '{MSG_ADD, MSG_EXEC, MSG_CANCEL, MSG_DELETE, MSG_REPLACE};
+    int holes;
+    holes = 0;
+    $display("  coverage (message kind x table outcome):");
+    for (int i = 0; i < 5; i++) begin
+      string lo, hi;
+      hi = (ks[i] == MSG_ADD) ? "tracked" : "hit";
+      lo = (ks[i] == MSG_ADD) ? "untracked" : "miss";
+      $display("    %-8s %s=%0d %s=%0d", kinds[i],
+               hi, cov_kind_outcome[int'(ks[i])][1],
+               lo, cov_kind_outcome[int'(ks[i])][0]);
+      for (int o = 0; o < 2; o++)
+        if (cov_kind_outcome[int'(ks[i])][o] == 0) begin
+          $display("    COVERAGE HOLE: %s x %s never occurred", kinds[i],
+                   o == 1 ? hi : lo);
+          holes++;
+        end
+    end
+    if (cov_add_tracked[1] == 0 || cov_add_tracked[0] == 0) begin
+      $display("    COVERAGE HOLE: ADD x {tracked=%0d, untracked=%0d}",
+               cov_add_tracked[1], cov_add_tracked[0]);
+      holes++;
+    end
+    if (holes != 0)
+      $fatal(1, "random phase left %0d functional-coverage bin(s) empty", holes);
+  endfunction
+
   // Mirror of MarketModel.on_message, order-ID-table half only (the price-book
   // half is price_book's problem): produces the op stream and the drops.
   function automatic void model_msg(decoded_msg_t m, string name);
@@ -169,6 +226,7 @@ module tb_book_router;
     case (m.kind)
       MSG_ADD: begin
         idx = sym_lookup(m.symbol);
+        cov_hit(MSG_ADD, idx >= 0);
         if (idx < 0) begin
           ref_drop++;                       // untracked symbol: no table insert
         end else begin
@@ -178,6 +236,7 @@ module tb_book_router;
       end
 
       MSG_EXEC, MSG_CANCEL: begin
+        cov_hit(m.kind, sb_idx.exists(oid));
         if (!sb_idx.exists(oid)) begin
           ref_drop++;
         end else begin
@@ -190,6 +249,7 @@ module tb_book_router;
       end
 
       MSG_DELETE: begin
+        cov_hit(MSG_DELETE, sb_idx.exists(oid));
         if (!sb_idx.exists(oid)) begin
           ref_drop++;
         end else begin
@@ -199,6 +259,7 @@ module tb_book_router;
       end
 
       MSG_REPLACE: begin
+        cov_hit(MSG_REPLACE, sb_idx.exists(oid));
         if (!sb_idx.exists(oid)) begin
           ref_drop++;
         end else begin
@@ -621,6 +682,7 @@ module tb_book_router;
     do_reset();
     live.delete();
     tracked_adds = 0;
+    cov_on = 1'b1;
 
     for (int n = 0; n < 5000; n++) begin
       r = $urandom_range(99, 0);
@@ -700,9 +762,10 @@ module tb_book_router;
 
     repeat (4) @(negedge clk);
     check_counts("random phase");
-    // 5,000 messages over a 65,536-entry table never exhaust an 8-deep probe
-    // window, so every insert must have succeeded and occupancy must equal the
-    // scoreboard's live-entry count.
+    // 5,000 messages over a 2**TABLE_ADDR_W-entry table (4,194,304 slots at the
+    // shipped TABLE_ADDR_W = 22) never exhaust an 8-deep probe window, so every
+    // insert must have succeeded and occupancy must equal the scoreboard's
+    // live-entry count.
     if (table_full_count !== 32'd0)
       $fatal(1, "random phase hit table_full_count=%0d", table_full_count);
     check_occupancy("random phase", sb_idx.num());
@@ -714,6 +777,8 @@ module tb_book_router;
 
     $display("  random phase: ok (%0d messages, %0d ops total, drop=%0d, occupancy=%0d)",
              msg_num, ops_seen, drop_count, occupancy);
+    cov_check();
+    cov_on = 1'b0;   // the capacity phase is ADD/DELETE churn, not a cross
 
     // ------------------------------------------------------------ capacity
     // TABLE_ADDR_W is sized for the real capture, whose AAPL+MSFT order flow
@@ -779,11 +844,25 @@ module tb_book_router;
     $finish;
   end
 
-  // Watchdog. The table-clear sweep after each reset costs 2^TABLE_ADDR_W
-  // cycles, and there are two resets, so allow generously.
+  // Watchdog, scaled from TABLE_ADDR_W rather than hard-coded: the run is
+  // dominated by the two post-reset table-clear sweeps (do_reset() is called
+  // twice, each costing 2**TABLE_ADDR_W cycles -- 8.4M of the ~8.8M total at
+  // TABLE_ADDR_W = 22), so a fixed constant silently loses its margin the
+  // moment the table is resized. The fixed budget on top covers all the
+  // stimulus (~125,000 messages at up to 19 busy cycles plus gaps, well under
+  // 3M cycles) with room to spare.
+  localparam int  CLK_PERIOD_NS   = 10;   // `always #5 clk = ~clk`
+  localparam int  RESET_SWEEPS    = 2;    // do_reset() calls in the test body
+  localparam longint STIMULUS_CYCLES = 8_000_000;
+  localparam longint WATCHDOG_NS =
+      (RESET_SWEEPS * (longint'(1) << TABLE_ADDR_W) + STIMULUS_CYCLES)
+      * CLK_PERIOD_NS;
+
   initial begin
-    #100000000;
-    $fatal(1, "TIMEOUT");
+    #(WATCHDOG_NS);   // timescale is 1ns/1ps, so delay units are ns
+    $fatal(1, "TIMEOUT after %0d ns (%0d clear-sweep cycles + %0d stimulus cycles)",
+           WATCHDOG_NS, RESET_SWEEPS * (longint'(1) << TABLE_ADDR_W),
+           STIMULUS_CYCLES);
   end
 
 endmodule
