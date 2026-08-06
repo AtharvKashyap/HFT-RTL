@@ -24,9 +24,19 @@ make replay-headline                   # the 10M run below
    `itch_book_top` one byte per cycle, honouring `in_ready`, and writes
    `rtl_N.jsonl` on every `upd_valid`.
 3. `model/compare_traces.py` compares the two traces line for line, ignoring only
-   the RTL-only `lat`/`timestamp` fields. Message ordinal `n`, symbol index, and
-   all 8 bid + 8 ask (price, shares) pairs must match exactly, and the two update
-   sequences must line up 1:1.
+   the RTL-only `lat` field (cycles from message boundary to update — the sole
+   hardware-only value in the trace; neither producer emits a timestamp).
+   Message ordinal `n`, symbol index, and all 8 bid + 8 ask (price, shares) pairs
+   must match exactly, and the two update sequences must line up 1:1.
+
+Non-vacuity: "0 mismatches" is only meaningful if something was actually
+compared, so every line is shape-checked before comparison (the four contract
+keys must be present, and both level lists must be exactly 8 deep — two equally
+degenerate stubs cannot match each other), and `run_replay.sh` passes
+`--min-updates` to the comparator: 1 by default, 100 for `--limit ≥ 1,000,000`.
+A run that matched fewer updates than that exits 1 with a `VACUOUS:` message.
+The 10k rung is the one legitimate exception (see below) and needs an explicit
+`--min-updates 0`.
 
 Ordinal alignment: `n` is the index over **all** messages read from the capture
 (parsed or not, tracked or not). In the RTL that ordinal is derived from the DUT's
@@ -67,16 +77,20 @@ turns out not to matter for speed).
 | Throughput | 33,543 msgs/sec, 1,195,336 cycles/sec |
 | End-to-end wall time (dump + build + run + compare) | 5 min 33 s |
 
-Of the 10M messages, 8,292,456 were dropped by the symbol filter (untracked
-symbols) and 1,344,052 were message types the book does not model (counted as
-unknown), leaving ~363k messages that actually touched a book.
+Of the 10M messages, 8,292,456 were dropped by `book_router` (`drop_count` —
+untracked-symbol ADDs *plus* follow-up messages whose order id was never
+inserted; see the counter table below) and 1,344,052 were message types the book
+does not model (counted as unknown), leaving ~363k messages that actually touched
+a book.
 
 ## Run ladder
 
 Each rung is a complete dump → replay → compare cycle. The 10k rung exercises the
 plumbing only: the first 10k records of the trading day are pre-open
 administrative messages (9,999 unknown, 1 system event), so no book update exists
-to compare.
+to compare — which is exactly the vacuous case the `--min-updates` gate rejects,
+so that rung must be run as
+`scripts/run_replay.sh --limit 10000 --min-updates 0`.
 
 | Messages | Updates | Mismatches | Cycles | Sim wall | msgs/sec |
 |---|---|---|---|---|---|
@@ -123,13 +137,25 @@ from linear-probe depth on a table lookup.
 | Counter | Value | Meaning |
 |---|---|---|
 | `gap_count` | 0 | MoldUDP64 sequence gaps — none, the stream is locally generated and contiguous |
-| `malformed_count` | 0 | framing/length violations |
+| `malformed_count` | 0 | zero-length message records (`len == 0` in a MoldUDP64 block) — the only framing violation `mold_framer` counts |
 | `unknown_count` | 1,344,052 | ITCH types the book does not model, skipped by length |
-| `drop_count` | 8,292,456 | messages for symbols outside the tracked 8 |
+| `drop_count` | 8,292,456 | untracked-symbol ADDs **+** order-ID lookup misses (see below) |
 | `table_full_count` | **0** | ADDs rejected because all 8 probe slots were taken |
 | `reduce_miss_count` | 17,882 | REDUCE at a price not in the top 8 — dropped by contract, matched by the model |
 | `evict_count` | 102,998 | price levels pushed out of the top 8 and permanently discarded — matched by the model |
 | `end_of_session` | 1 | MoldUDP64 end-of-session trailer seen |
+
+`drop_count` is **not** a symbol-filter counter, despite being dominated by
+untracked symbols. `book_router` increments it in two distinct places: an ADD
+whose symbol is not one of the tracked 8 (dropped, and deliberately never
+inserted into the order table), and an EXEC/CANCEL/DELETE/REPLACE whose order id
+is not in the table. The second case is mostly *caused* by the first — every
+child message of an untracked ADD necessarily misses — but the two are separate
+events and the split is not 1:1. Measured on the 300k rung: 24,829
+untracked-symbol ADDs against 32,381 order-table lookup misses, i.e. the miss
+count is the larger of the two. Both are normal, expected behaviour on a
+symbol-filtered feed, not error conditions; the Python model makes the identical
+free/keep decisions, which is why the traces still match exactly.
 
 `reduce_miss` and `evict` are non-zero *by design*: the top-8 truncation contract
 says a level pushed out of the window is gone forever and a REDUCE that lands
@@ -155,15 +181,33 @@ length prefix always matches its own actual bytes — see the module docstring
 for why that matters), truncated to a random whole number of surviving
 packets, followed by a **clean tail of 1,000 valid messages under a fresh
 MoldUDP64 session**. `tb/replay/replay_main.cpp --fuzz --tail-start <N>` runs
-that stream against `itch_book_top` and checks three things: no hang (some
-observable output — a status counter, `msg_boundary`, or `upd_valid` — must
-change within 10,000 cycles at every point while bytes remain), error
-counters end up nonzero, and at least one book update is emitted from bytes at
-or after the tail boundary. Book-state equality with a clean run is
-explicitly not checked — resync semantics (recovering the *same* state a
-clean run would reach) are out of scope; what is verified is that the pipeline
-never stops decoding and keeps producing correct operations on new input
-after the disruption.
+that stream against `itch_book_top`.
+
+**What this actually proves: liveness under corruption, and nothing stronger.**
+The three pass criteria are exactly three liveness properties —
+
+1. **No hang.** Some observable output — a status counter, `msg_boundary`, or
+   `upd_valid` — must change within 10,000 cycles at every point while bytes
+   remain. The pipeline never wedges.
+2. **Counters move.** The error counters end up nonzero, i.e. the corruption
+   was noticed and accounted rather than silently swallowed.
+3. **Updates resume.** At least one book update is emitted from bytes at or
+   after the tail boundary, so the pipeline is still decoding, routing and
+   updating books after the disruption — not merely still clocking.
+
+None of these is a *state-level* robustness claim. Book contents after the
+fuzz burst are never compared against anything: resync semantics (recovering
+the *same* state a clean run would reach) are out of scope, and a run in which
+every post-tail book were wrong in value but present in form would still pass.
+The claim is "never stops consuming, always accounts, comes back to life" — not
+"state survives corruption".
+
+Criterion 2 also deserves a caveat: `gap_count ≥ 1` is guaranteed by the test's
+own construction, not by the corruption. The clean tail is spliced in under a
+*fresh* MoldUDP64 session, so a sequence discontinuity exists at the boundary in
+every seed by design. The genuinely corruption-driven signal is in the other
+counters (`malformed_count` / `unknown_count`), which is why the table below
+reports `error_counters_sum` rather than `gap_count` alone.
 
 | Seed | Bytes fed | `hang_detected` | `error_counters_sum` | `updates_before_tail` | `updates_after_tail` | Result |
 |---|---|---|---|---|---|---|
@@ -171,9 +215,11 @@ after the disruption.
 | 2 | 43,185 | no | 651 | 220 | 623 | **PASS** |
 | 3 | 42,105 | no | 596 | 213 | 647 | **PASS** |
 
-`gap_count` is 1 in every seed — the single, expected discontinuity where the
-tail's fresh session/sequence begins; `mold_framer` absorbs it and keeps
-consuming rather than treating it as fatal. `updates_after_tail > 0` in every
+`gap_count` is 1 in every seed — the single discontinuity where the tail's fresh
+session/sequence begins. As noted above this is *built in* by the splice, so it
+is evidence that `mold_framer` absorbs a gap and keeps consuming rather than
+treating it as fatal, and not evidence that the fuzzer found anything.
+`updates_after_tail > 0` in every
 run confirms the tail is not just passed through as bytes but actually
 decoded, routed, and reaches a price book again.
 
@@ -193,11 +239,21 @@ Left as-is.
 
 ## Unit tests
 
-- `python3 -m pytest -q` — 53 passed (golden model, ITCH parsing, BinaryFILE
-  reader, MoldUDP64 wrapper, `--wrap-out` byte-identity, trace comparator,
-  fuzz-stream corruption/tail-integrity).
+- `python3 -m pytest -q` — 58 passed (golden model, ITCH parsing, BinaryFILE
+  reader, MoldUDP64 wrapper, `--wrap-out` byte-identity, trace comparator
+  including its shape check and `--min-updates` non-vacuity gate, fuzz-stream
+  corruption/tail-integrity).
 - `make -C tb/unit TOP=<tb> run` for `tb_mold_framer`, `tb_itch_decoder`,
   `tb_price_book`, `tb_book_router`, `tb_itch_book_top` — all pass.
+
+Functional coverage is tallied by hand in the two random-stimulus TBs (Verilator
+does not implement covergroups) and gated: `tb_price_book` requires all 14 bins
+of {ADD-new-level, ADD-aggregate, ADD-evict-9th, ADD-reject-full,
+REDUCE-partial, REDUCE-remove, REDUCE-miss} × {bid, ask} to be hit, and
+`tb_book_router` all 10 bins of {ADD, EXEC, CANCEL, DELETE, REPLACE} ×
+{hit, miss} (for ADD: tracked / untracked). An empty bin is a `$fatal`, not a
+warning. See "Deviations from the spec" in
+[`docs/superpowers/specs/2026-08-05-itch-order-book-design.md`](superpowers/specs/2026-08-05-itch-order-book-design.md).
 
 ## Reproducing
 

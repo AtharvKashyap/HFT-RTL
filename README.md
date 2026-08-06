@@ -88,10 +88,18 @@ comparison after every book update.
 | Messages replayed | 10,000,000 |
 | Book updates emitted | 260,053 |
 | **Mismatches vs golden model** | **0** |
-| Tracked-symbol book operations | ~363,000 (8.29M dropped by symbol filter, 1.34M unmodeled types) |
+| Tracked-symbol book operations | ~363,000 (8.29M `drop_count`, 1.34M unmodeled types) |
 | Latency (msg boundary → book update) | min 4, median 4, p99 5, max 7 cycles |
 | Throughput | ~33,500 msgs/sec sim (1 byte/cycle datapath, so cycle-bound, not logic-bound) |
 | Order table sizing | `TABLE_ADDR_W = 22` (4.19M slots) — the smallest size, found empirically, with zero probe-window overflows on this capture's peak of ~94,800 live orders (see `rtl/book_pkg.sv`) |
+
+`drop_count` = untracked-symbol ADDs **+** order-ID lookup misses (follow-up
+messages for orders that were never inserted — overwhelmingly the children of
+untracked ADDs, since an untracked ADD deliberately never enters the order
+table). It is not a pure symbol-filter count: on the 300k rung the split is
+24,829 untracked ADDs against 32,381 lookup misses. Both are normal behaviour on
+a symbol-filtered feed, not errors, and the Python model makes the identical
+decisions.
 
 Full breakdown, run ladder (10k/300k/1M/10M), and counter definitions in
 [`docs/results.md`](docs/results.md).
