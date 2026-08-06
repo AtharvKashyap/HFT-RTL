@@ -1,4 +1,4 @@
-# rtlbook — verification results
+# hft-rtl — verification results
 
 Golden-model vs RTL replay. The Python model (`model/`) and the SystemVerilog
 pipeline (`rtl/`) consume a **byte-identical** input stream and their book

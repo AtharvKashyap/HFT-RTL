@@ -1,9 +1,8 @@
-# rtlbook
+# hft-rtl
 
-A limit order book in SystemVerilog.
-
-Synthesizable SystemVerilog that consumes a Nasdaq TotalView-ITCH 5.0 feed one
-byte per cycle and maintains live top-8 price-level books for 16 symbols:
+A Nasdaq ITCH limit order book in synthesizable SystemVerilog. Consumes a
+TotalView-ITCH 5.0 feed one byte per cycle and maintains live top-8
+price-level books for 16 symbols:
 MoldUDP64 framing → ITCH decode → order-ID hash table → per-symbol price books.
 10,000,000 messages from a real Nasdaq capture were replayed through the RTL and
 a Python golden model in lockstep: 260,053 book updates, 0 mismatches. Latency
