@@ -1,21 +1,12 @@
 # Hardware ITCH Order Book
 
-A synthesizable SystemVerilog pipeline that ingests a real Nasdaq
-TotalView-ITCH 5.0 market-data feed, byte by byte, and maintains live top-8
-price-level order books for up to 16 symbols — the same job an FPGA sits in
-front of an exchange feed to do in a real trading system, before a strategy
-ever sees a price.
-
-Market-data parsing is the first stage of any tick-to-trade pipeline, and it's
-the stage where nanoseconds compound: every symbol, every book operation,
-every cycle of latency here happens once per message, all day. This project
-builds that stage for real — the actual wire protocol (ITCH 5.0 over
-MoldUDP64), a real full-day capture from Nasdaq (not synthetic test vectors),
-and a verification story built the way hardware teams actually verify
-datapaths: a golden software model compared bit-for-bit against RTL simulation
-over millions of real messages, directed and constrained-random unit tests per
-module, and a fuzz pass that proves the design never hangs or corrupts state
-on malformed input. Every number below is from an actual run, not a target.
+Synthesizable SystemVerilog that consumes a Nasdaq TotalView-ITCH 5.0 feed one
+byte per cycle and maintains live top-8 price-level books for 16 symbols:
+MoldUDP64 framing → ITCH decode → order-ID hash table → per-symbol price books.
+10,000,000 messages from a real Nasdaq capture were replayed through the RTL and
+a Python golden model in lockstep: 260,053 book updates, 0 mismatches. Latency
+from message boundary to book update is 4 cycles median, 7 worst case over those
+260k updates. Verified in Verilator simulation only — no synthesis results yet.
 
 ## Architecture
 
@@ -31,120 +22,101 @@ on malformed input. Every number below is from an actual run, not a target.
                  └────────────────────────────────────────────────────────┘
 ```
 
-- **`mold_framer`** — strips MoldUDP64 packet framing (session, sequence,
-  message count, per-message length prefix), tracks sequence continuity, and
-  hands the ITCH decoder one message at a time with a byte-accurate boundary
-  pulse.
-- **`itch_decoder`** — decodes Add/Add-w-MPID, Executed, Executed-w-Price,
-  Cancel, Delete, Replace, and System-Event messages into a common struct;
-  unknown/malformed types are counted and dropped, never fatal.
-- **`book_router`** (order-ID table + symbol filter) — a hash table with
-  bounded linear probing maps ITCH order IDs to {book index, side, price,
-  shares}; non-tracked symbols are filtered before they ever enter it.
-- **`price_book`** ×16 (one per tracked symbol) — sorted top-8 price levels
-  per side, insert/reduce/evict in a fixed small cycle count via parallel
-  compare, not iterative search. In-RTL assertions check sort order, no
-  duplicate prices, and no share underflow.
-- **`itch_book_top`** — wires the above together behind one ready/valid byte
-  stream in, one book-update stream out, plus a status/counter port.
+- **`mold_framer`** — strips MoldUDP64 framing (session, sequence, message
+  count, per-message length prefix), tracks sequence continuity, emits one
+  message at a time with a byte-accurate boundary pulse.
+- **`itch_decoder`** — Add, Add-w-MPID, Executed, Executed-w-Price, Cancel,
+  Delete, Replace, System-Event into a common struct; unknown types are counted
+  and skipped by length.
+- **`book_router`** — hash table with bounded linear probing (`MAX_PROBES = 8`)
+  mapping order IDs to {book index, side, price, shares}; untracked symbols are
+  filtered before insertion.
+- **`price_book`** ×16 — sorted top-8 levels per side, insert/reduce/evict in a
+  fixed cycle count via parallel compare rather than iterative search. In-RTL
+  assertions check sort order, price uniqueness, and share underflow.
 
-Every abnormal condition — a sequence gap, an unknown message type, a full
-probe window, an untracked symbol, a malformed frame — is **counted and
-dropped, never fatal**. The pipeline always keeps consuming.
+Every abnormal condition — sequence gap, unknown message type, full probe
+window, untracked symbol, malformed frame — is counted and dropped, never fatal.
 
-## Quickstart
+## Results
 
-Dependencies: [Verilator](https://verilator.org) ≥ 5.0 (`brew install
-verilator` on macOS), Python 3.
-
-```bash
-# 1. Python golden model + its own test suite (parser, book, MoldUDP64 wrapper)
-python3 -m pytest -q                        # or: make test-model
-
-# 2. Per-module RTL testbenches (directed + constrained-random, Verilator)
-make -C tb/unit TOP=tb_mold_framer   run
-make -C tb/unit TOP=tb_itch_decoder  run
-make -C tb/unit TOP=tb_price_book    run
-make -C tb/unit TOP=tb_book_router   run
-make -C tb/unit TOP=tb_itch_book_top run
-
-# 3. Golden-model-vs-RTL replay over real Nasdaq ITCH data
-scripts/download_data.sh                    # ~3.5 GB, one-time
-make replay LIMIT=1000000                   # ~30 s sim, see docs/results.md
-make replay-headline                        # the 10M-message headline run, ~5 min
-
-# 4. Fuzz robustness: corrupted stream + clean-tail recovery, 3 seeds
-make fuzz
-```
-
-## Headline results
-
-10,000,000 real Nasdaq ITCH messages replayed through both the Python golden
-model and the RTL in lockstep, byte-identical input, field-by-field snapshot
-comparison after every book update.
+Byte-identical input to both implementations, field-by-field snapshot
+comparison after every update.
 
 | Metric | Value |
 |---|---|
 | Messages replayed | 10,000,000 |
 | Book updates emitted | 260,053 |
-| **Mismatches vs golden model** | **0** |
-| Tracked-symbol book operations | ~363,000 (8.29M `drop_count`, 1.34M unmodeled types) |
-| Latency (msg boundary → book update) | min 4, median 4, p99 5, max 7 cycles |
-| Throughput | ~33,500 msgs/sec sim (1 byte/cycle datapath, so cycle-bound, not logic-bound) |
-| Order table sizing | `TABLE_ADDR_W = 22` (4.19M slots) — the smallest size, found empirically, with zero probe-window overflows on this capture's peak of ~94,800 live orders (see `rtl/book_pkg.sv`) |
+| Mismatches vs golden model | **0** |
+| Latency, msg boundary → update | 4 / 4 / 5 / 7 cycles (min / median / p99 / max) |
+| Sim throughput | 33,543 msgs/sec (1 byte/cycle, so cycle-bound) |
+| Order table | `TABLE_ADDR_W = 22` (4.19M slots), 0 probe-window overflows |
+| Peak live orders in capture | ~94,800 |
 
-`drop_count` = untracked-symbol ADDs **+** order-ID lookup misses (follow-up
-messages for orders that were never inserted — overwhelmingly the children of
-untracked ADDs, since an untracked ADD deliberately never enters the order
-table). It is not a pure symbol-filter count: on the 300k rung the split is
-24,829 untracked ADDs against 32,381 lookup misses. Both are normal behaviour on
-a symbol-filtered feed, not errors, and the Python model makes the identical
-decisions.
+`TABLE_ADDR_W = 22` was found empirically, not by occupancy math: at 20 bits the
+same run overflowed a probe window and diverged permanently. The failure mode is
+clustering — near-sequential ITCH order IDs XOR-fold to near-sequential slots —
+so address bits, not probe depth, are the lever.
 
-Full breakdown, run ladder (10k/300k/1M/10M), and counter definitions in
+Run ladder (10k/300k/1M/10M), counter definitions, and fuzz numbers:
 [`docs/results.md`](docs/results.md).
 
-## Verification approach
+## Quickstart
 
-Three layers, each catching a different class of bug:
+Requires Verilator ≥ 5.0 (`brew install verilator`), Python 3, and ~4 GB free
+disk for the capture.
 
-1. **Unit testbenches** (`tb/unit/`, one per module) — directed edge cases
-   (gaps, heartbeats, split messages, every ITCH type, collision handling,
-   table full, level eviction, side crossing) plus constrained-random
-   stimulus with in-RTL immediate assertions compiled into the design.
-2. **Golden-model replay** (`tb/replay/`, `model/`) — a from-scratch Python
-   reference implementation of the same ITCH parsing and book semantics
-   (including identical top-8 truncation rules), replayed against the RTL
-   over a real 10M-message Nasdaq capture with a field-by-field comparator.
-   This is the headline result above.
-3. **Fuzz robustness** (`model/fuzz_stream.py`, `tb/replay/replay_main.cpp
-   --fuzz`) — a seeded, corrupted MoldUDP64 stream (byte flips, bogus
-   length fields, truncated packets) followed by a clean 1,000-message tail.
-   Pass criteria: no hang (an internal watchdog requires observable progress
-   within 10,000 cycles at all times), error counters end up nonzero, and the
-   clean tail produces book updates again. Ran across 3 seeds, all pass — see
-   [`docs/results.md`](docs/results.md#fuzz-robustness) for the numbers and
-   for why book-state equality with a clean run is explicitly *not* checked.
+```bash
+scripts/download_data.sh                  # 3.5 GB Nasdaq sample, one-time
+make test-model                           # Python golden model suite, 58 tests
+for tb in tb_mold_framer tb_itch_decoder tb_price_book tb_book_router \
+          tb_itch_book_top; do
+  make -C tb/unit TOP=$tb run || break    # per-module RTL testbenches
+done
+make replay LIMIT=300000                  # golden-vs-RTL, ~10 s sim
+make replay-headline                      # the full 10M run, ~6 min end to end
+make fuzz                                 # corrupted-stream robustness, 3 seeds
+```
 
-## Phase-2 roadmap
+`make replay LIMIT=300000` prints `MATCH: 1022 updates identical` on success and
+exits nonzero on any mismatch.
 
-Out of scope for this milestone, but the natural next steps:
+## How it is verified
 
-- **UVM-on-VCS** — same RTL, a UVM testbench (driver/monitor/scoreboard)
-  reusing the Python golden trace as the reference model, run on a
-  university/lab VCS license.
-- **Vivado synthesis + timing-derived latency** — synthesize for a real FPGA
-  target, get an achieved Fmax, and convert the measured cycle latencies
-  above into actual nanoseconds.
-- **Tick-to-trade extension** — add a strategy block and order generator
-  downstream of the book updates to turn this into a full round-trip
-  tick-to-trade engine.
-- **Wide datapath** — v1 is 1 byte/cycle by design (simplicity for
-  verification); widening the input datapath (e.g. 8 or 16 bytes/cycle) is
-  the natural throughput lever once the pipeline logic is proven correct.
-- **Order-table hash mixing + board-fit compression** — the current table
-  trades memory for correctness (2^22 slots, full 64-bit order IDs, sized
-  empirically against this capture's clustering — see `rtl/book_pkg.sv`); a
-  board port would mix the hash to break up near-sequential ITCH order-ID
-  clustering and store a compressed tag instead of the full ID, so the table
-  fits in on-chip memory instead of scaling with address bits.
+1. **Unit testbenches** (`tb/unit/`, one per module) — directed edge cases plus
+   constrained-random stimulus, with in-RTL assertions and hand-tallied
+   functional coverage bins that `$fatal` if left empty.
+2. **Golden-model replay** (`model/`, `tb/replay/`) — an independent Python
+   implementation of the same parsing and book semantics, compared line for line
+   against the RTL trace over the real capture, with a non-vacuity gate so "0
+   mismatches" cannot mean "nothing compared".
+3. **Fuzz** (`model/fuzz_stream.py`) — seeded corrupted MoldUDP64 stream plus a
+   clean 1,000-message tail; checks no hang (10,000-cycle watchdog), nonzero
+   error counters, and that updates resume after the corruption.
+
+## Limitations
+
+- Simulation only. No synthesis, no place-and-route, no Fmax — cycle counts here
+  have not been converted to nanoseconds.
+- Top-8 truncation is an approximation of a full book. A level evicted from the
+  window is gone permanently, and a REDUCE landing outside it is dropped and
+  counted (`reduce_miss_count`). The Python model reproduces this exactly, which
+  is why the traces match; it is still not a full-depth book.
+- `drop_count` mixes two events: untracked-symbol ADDs and order-ID lookup
+  misses. Follow-ups to untracked ADDs necessarily miss, so the two are related
+  but not 1:1 (300k rung: 24,829 vs 32,381). Normal behaviour on a filtered
+  feed, not errors.
+- The 2^22-slot order table with full 64-bit IDs will not fit in on-chip BRAM as
+  written. A board port needs hash mixing and a compressed tag.
+
+## Roadmap
+
+- Vivado synthesis for a real target: achieved Fmax, cycle latencies converted
+  to nanoseconds, resource utilization.
+- UVM testbench (driver/monitor/scoreboard) reusing the Python golden trace as
+  the reference model.
+- Tick-to-trade extension: strategy block and order generator downstream of the
+  book updates.
+- Wider input datapath (8 or 16 bytes/cycle) now that the 1 byte/cycle pipeline
+  is proven correct.
+- Order-table hash mixing and tag compression to fit on-chip memory.
