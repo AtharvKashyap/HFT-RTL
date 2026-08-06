@@ -27,7 +27,6 @@ module replay_top (
   output logic [book_pkg::N_LEVELS*32-1:0]  bid_shares,
   output logic [book_pkg::N_LEVELS*32-1:0]  ask_price,
   output logic [book_pkg::N_LEVELS*32-1:0]  ask_shares,
-  output logic [63:0] upd_timestamp,
 
   output logic        msg_boundary,
   output logic [31:0] gap_count, malformed_count, unknown_count,
@@ -67,6 +66,9 @@ module replay_top (
   assign bid_shares    = upd.bid_shares;
   assign ask_price     = upd.ask_price;
   assign ask_shares    = upd.ask_shares;
-  assign upd_timestamp = upd.timestamp;
+  // upd.timestamp is deliberately NOT exposed: the RTL trace never emits a
+  // timestamp field, so a port for it would be dead plumbing. `lat` (measured
+  // in replay_main.cpp from msg_boundary to upd_valid) is the only
+  // hardware-only field the trace carries.
 
 endmodule

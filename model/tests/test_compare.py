@@ -1,9 +1,13 @@
 """Tests for the golden-vs-RTL trace comparator (model/compare_traces.py).
 
 The comparator's job in the replay flow is narrow and must be exact: two JSONL
-traces line up 1:1, every field is compared except the ones that are legitimately
-implementation-specific (`lat`, the RTL harness's cycle latency, and `timestamp`,
-the RTL's free-running cycle counter). Exit code 0 == identical, 1 == divergence.
+traces line up 1:1, every field is compared except the one that is legitimately
+implementation-specific (`lat`, the RTL harness's cycle latency). Exit code
+0 == identical, 1 == divergence.
+
+Two traces can also agree vacuously -- both empty, or both structurally
+degenerate -- so the shape check and the `--min-updates` non-vacuity gate are
+tested here as well.
 """
 
 import json
@@ -29,11 +33,11 @@ def _write(path, lines):
 
 def test_identical_traces_match(tmp_path):
     golden = _write(tmp_path / "golden.jsonl", [_line(0), _line(1), _line(5)])
-    # RTL trace carries the extra lat/timestamp fields, which must be ignored.
+    # RTL trace carries the extra `lat` field, which must be ignored.
     rtl = _write(tmp_path / "rtl.jsonl", [
-        _line(0, lat=4, timestamp=1234),
-        _line(1, lat=7, timestamp=1290),
-        _line(5, lat=5, timestamp=1400),
+        _line(0, lat=4),
+        _line(1, lat=7),
+        _line(5, lat=5),
     ])
 
     result = compare_files(golden, rtl)
@@ -91,6 +95,52 @@ def test_truncated_trace_reports_cleanly(tmp_path):
     assert result["first_mismatch"]["index"] == 1
     assert "not valid JSON" in result["first_mismatch"]["reason"]
     assert main([golden, str(truncated)]) == 1
+
+
+def test_empty_traces_fail_the_non_vacuity_gate(tmp_path):
+    """Two empty traces trivially "match"; --min-updates must reject that."""
+    golden = _write(tmp_path / "golden.jsonl", [])
+    rtl = _write(tmp_path / "rtl.jsonl", [])
+
+    result = compare_files(golden, rtl)
+    assert result["mismatches"] == 0 and result["compared"] == 0
+    assert main([golden, rtl]) == 0                        # no gate: vacuous pass
+    assert main([golden, rtl, "--min-updates", "1"]) == 1  # gate catches it
+
+
+def test_min_updates_passes_when_enough_matched(tmp_path):
+    golden = _write(tmp_path / "golden.jsonl", [_line(0), _line(1), _line(2)])
+    rtl = _write(tmp_path / "rtl.jsonl", [_line(0), _line(1), _line(2)])
+
+    assert main([golden, rtl, "--min-updates", "3"]) == 0
+    assert main([golden, rtl, "--min-updates", "4"]) == 1
+
+
+def test_short_level_lists_fail_even_when_both_sides_agree(tmp_path):
+    """A stub with 4 levels per side must not pass just because both traces
+    are equally malformed -- the shape is part of the contract."""
+    stub = json.dumps({"n": 0, "symbol_idx": 0,
+                       "bid": [[100, 10]] + [[0, 0]] * 3,
+                       "ask": [[101, 20]] + [[0, 0]] * 3})
+    golden = _write(tmp_path / "golden.jsonl", [stub])
+    rtl = _write(tmp_path / "rtl.jsonl", [stub])
+
+    result = compare_files(golden, rtl)
+    assert result["mismatches"] == 1
+    assert "bad shape" in result["first_mismatch"]["reason"]
+    assert "4 levels" in result["first_mismatch"]["reason"]
+    assert main([golden, rtl]) == 1
+
+
+def test_missing_required_field_is_caught(tmp_path):
+    stub = json.dumps({"n": 0, "bid": [[0, 0]] * 8, "ask": [[0, 0]] * 8})
+    golden = _write(tmp_path / "golden.jsonl", [stub])
+    rtl = _write(tmp_path / "rtl.jsonl", [stub])
+
+    result = compare_files(golden, rtl)
+    assert result["mismatches"] == 1
+    assert "symbol_idx" in result["first_mismatch"]["reason"]
+    assert main([golden, rtl]) == 1
 
 
 def test_deeper_level_difference_is_caught(tmp_path):

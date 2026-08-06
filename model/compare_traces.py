@@ -6,17 +6,22 @@ Both files are JSONL, one line per book update, in the format written by
     {"n": <message ordinal>, "symbol_idx": <book index>,
      "bid": [[price, shares] x 8], "ask": [[price, shares] x 8]}
 
-The RTL trace carries two extra fields that are deliberately NOT compared:
-`lat` (cycles from message boundary to update, a hardware-only measurement)
-and `timestamp` (the DUT's free-running cycle counter, which has no meaning in
-the Python model). Everything else -- including the message ordinal `n` and the
-order of updates -- must be identical, so the two traces must line up 1:1.
+The RTL trace carries one extra field that is deliberately NOT compared: `lat`
+(cycles from message boundary to update, a hardware-only measurement).
+Everything else -- including the message ordinal `n` and the order of updates --
+must be identical, so the two traces must line up 1:1.
+
+Every line is also shape-checked before comparison: the four contract keys must
+be present and both level lists must be exactly N_LEVELS deep. Two traces that
+agree only because both are empty (or both truncated to stubs) are a vacuous
+pass, so `--min-updates N` fails a run that matched fewer than N updates.
 
 Streaming by design: the headline run compares tens of millions of lines, so
 neither file is ever loaded into memory.
 
 Usage:
     python -m model.compare_traces golden.jsonl rtl.jsonl [--max-report N]
+                                   [--min-updates N]
 Exit codes: 0 = identical, 1 = divergence (or unreadable input).
 """
 
@@ -26,22 +31,50 @@ import sys
 from typing import Iterator
 
 # Fields present only in the RTL trace, or otherwise not part of the contract.
-IGNORED_FIELDS = ("lat", "timestamp")
+# `timestamp` is NOT here: neither producer emits one.
+IGNORED_FIELDS = ("lat",)
+
+# Every trace line must carry exactly these keys (plus any IGNORED_FIELDS)...
+REQUIRED_FIELDS = ("n", "symbol_idx", "bid", "ask")
+# ...and both level lists must be this deep (book_pkg::N_LEVELS).
+N_LEVELS = 8
+
+
+class TraceShapeError(ValueError):
+    """A trace line parsed as JSON but is not a well-formed book update."""
 
 
 def _normalize(obj: dict) -> dict:
-    """Strip ignored fields and canonicalize level lists to lists-of-lists.
+    """Shape-check a line, strip ignored fields, canonicalize the level lists.
+
+    The shape check is what stops a structurally degenerate trace (missing
+    keys, short level lists) from comparing equal to an equally degenerate
+    counterpart: both sides are checked independently, so agreement on garbage
+    is a failure rather than a match.
 
     JSON gives lists already, but a producer could emit tuples-turned-lists of
     differing nesting; forcing the shape here means a real value difference is
     what fails, not a representation difference.
     """
+    if not isinstance(obj, dict):
+        raise TraceShapeError(f"line is a {type(obj).__name__}, expected an object")
+    missing = [k for k in REQUIRED_FIELDS if k not in obj]
+    if missing:
+        raise TraceShapeError(f"missing required field(s): {', '.join(missing)}")
+
     out = {}
     for key, value in obj.items():
         if key in IGNORED_FIELDS:
             continue
         if key in ("bid", "ask"):
-            out[key] = [[int(p), int(s)] for p, s in value]
+            if not isinstance(value, list) or len(value) != N_LEVELS:
+                raise TraceShapeError(
+                    f"`{key}` has {len(value) if isinstance(value, list) else '?'} "
+                    f"levels, expected {N_LEVELS}")
+            try:
+                out[key] = [[int(p), int(s)] for p, s in value]
+            except (TypeError, ValueError) as exc:
+                raise TraceShapeError(f"`{key}` is not a list of [price, shares]: {exc}")
         else:
             out[key] = value
     return out
@@ -55,10 +88,10 @@ def _read_lines(path: str) -> Iterator[str]:
                 yield line
 
 
-def _unparsable(which: str, index: int, raw: str, exc: Exception, compared: int) -> dict:
+def _bad_line(which: str, index: int, raw: str, reason: str, compared: int) -> dict:
     detail = {
         "index": index,
-        "reason": f"{which} trace line is not valid JSON ({exc}) -- truncated file?",
+        "reason": f"{which} trace line {reason}",
         "golden": raw if which == "golden" else None,
         "rtl": raw if which == "rtl" else None,
     }
@@ -111,15 +144,21 @@ def compare_files(golden_path: str, rtl_path: str, max_report: int = 5) -> dict:
         # A trace whose last line is truncated means the producer was killed
         # mid-write; report that as a divergence at a known ordinal rather than
         # letting a JSONDecodeError traceback escape after millions of good
-        # lines.
-        try:
-            g_obj = _normalize(json.loads(g_raw))
-        except ValueError as exc:
-            return _unparsable("golden", index, g_raw, exc, compared)
-        try:
-            r_obj = _normalize(json.loads(r_raw))
-        except ValueError as exc:
-            return _unparsable("rtl", index, r_raw, exc, compared)
+        # lines. A well-formed JSON line that is not a well-formed book update
+        # (missing keys, short level lists) is reported the same way -- it can
+        # never be a legitimate match, even against an identical stub.
+        for which, raw in (("golden", g_raw), ("rtl", r_raw)):
+            try:
+                obj = _normalize(json.loads(raw))
+            except TraceShapeError as exc:
+                return _bad_line(which, index, raw, f"has a bad shape ({exc})", compared)
+            except ValueError as exc:
+                return _bad_line(which, index, raw,
+                                 f"is not valid JSON ({exc}) -- truncated file?", compared)
+            if which == "golden":
+                g_obj = obj
+            else:
+                r_obj = obj
 
         if g_obj != r_obj:
             mismatches += 1
@@ -153,6 +192,9 @@ def main(argv=None) -> int:
     parser.add_argument("rtl", help="RTL trace .jsonl (from tb/replay)")
     parser.add_argument("--max-report", type=int, default=5,
                         help="Stop after reporting this many mismatches (default 5)")
+    parser.add_argument("--min-updates", type=int, default=0, metavar="N",
+                        help="Fail if fewer than N updates matched -- a non-vacuity "
+                             "gate, so two empty or stub traces cannot pass (default 0)")
     args = parser.parse_args(argv)
 
     try:
@@ -162,6 +204,12 @@ def main(argv=None) -> int:
         return 1
 
     if result["mismatches"] == 0:
+        if result["compared"] < args.min_updates:
+            print(f"VACUOUS: only {result['compared']} update(s) matched, "
+                  f"--min-updates requires at least {args.min_updates}. "
+                  f"A run that compares (almost) nothing proves nothing -- check "
+                  f"that both traces were actually produced.", file=sys.stderr)
+            return 1
         print(f"MATCH: {result['compared']} updates identical "
               f"(ignoring {', '.join(IGNORED_FIELDS)})")
         return 0
