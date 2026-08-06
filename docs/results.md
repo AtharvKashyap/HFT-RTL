@@ -49,7 +49,9 @@ run) as an independent check that the two numbering schemes start together.
 | Symbols tracked | AAPL, MSFT, SPY, QQQ, TSLA, NVDA, AMD, INTC — `book_idx` = position in this list, fixed at verilate time and passed identically to `dump_trace --symbols` |
 
 Environment: Verilator 5.050, macOS (Darwin 25.5.0) on Apple Silicon, single
-threaded, model compiled at `-O3` (`OPT_FAST=-O3`).
+threaded. Verilated with `-O3`; the generated C++ model is compiled at `-O3` via
+`-MAKEFLAGS OPT_FAST=-O3` (see the note under [Throughput](#throughput) — it
+turns out not to matter for speed).
 
 ## Headline run — 10,000,000 messages
 
@@ -61,9 +63,9 @@ threaded, model compiled at `-O3` (`OPT_FAST=-O3`).
 | **Mismatches vs golden model** | **0** |
 | Orphan updates | 0 |
 | Simulated cycles | 356,357,526 (incl. the 4,194,305-cycle post-reset table sweep) |
-| Sim wall time | 300.79 s (5 min 1 s) |
-| Throughput | 33,245 msgs/sec, 1,184,727 cycles/sec |
-| End-to-end wall time (dump + build + run + compare) | 5 min 35 s |
+| Sim wall time | 298.12 s (4 min 58 s) |
+| Throughput | 33,543 msgs/sec, 1,195,336 cycles/sec |
+| End-to-end wall time (dump + build + run + compare) | 5 min 33 s |
 
 Of the 10M messages, 8,292,456 were dropped by the symbol filter (untracked
 symbols) and 1,344,052 were message types the book does not model (counted as
@@ -80,8 +82,24 @@ to compare.
 |---|---|---|---|---|---|
 | 10,000 | 0 | 0 | 4,599,022 | 3.0 s | 3,319 |
 | 300,000 | 1,022 | 0 | 13,123,297 | 8.7 s | 34,420 |
-| 1,000,000 | 13,526 | 0 | 34,455,373 | 22.8 s | 43,825 |
-| 10,000,000 | 260,053 | **0** | 356,357,526 | 300.8 s | 33,245 |
+| 1,000,000 | 13,526 | 0 | 34,455,373 | 28.7 s | 34,821 |
+| 10,000,000 | 260,053 | **0** | 356,357,526 | 298.1 s | 33,543 |
+
+## Throughput
+
+Sim throughput is ~33-37k msgs/sec (~1.2M cycles/sec) and is dominated by the 1
+byte/cycle input rate: 10M messages is 352M bytes, hence 352M+ cycles, whatever
+the message mix. It dips over the run (37.5k msgs/sec through the first 5M, 33.2k
+after) because the later part of the session carries more tracked-symbol traffic,
+so more cycles do book work rather than being filtered away.
+
+Compiling the generated model at `-O3` instead of Verilator's `-Os` default made
+no useful difference — measured over the same 1M-message rung, `-Os` ran the first
+1M messages in 29.4 s and `-O3` in 28.7-28.8 s, inside run-to-run noise. The
+`-O3` build is kept because the brief asks for it and it is what the recorded
+numbers above were produced with, but it is not a speed lever: the model is
+memory-bound on the order table, not compute-bound. (An earlier 22.8 s figure for
+a standalone 1M run reflected a warm page cache, not the compiler flag.)
 
 ## Latency
 

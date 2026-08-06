@@ -16,13 +16,31 @@
 // framer, on the cycle carrying that message's last byte -- so after the pulse
 // for message k, `msgs_seen` is k+1 and any update that follows belongs to
 // message k = msgs_seen-1. Hence, each cycle: consume `upd_valid` FIRST using
-// msgs_seen-1, THEN apply this cycle's boundary pulse. Both orderings agree in
-// practice because an update cannot arrive as late as the next boundary --
-// framer->decoder is 1 cycle, the router's worst case is 16 (a REPLACE probing
-// MAX_PROBES twice), and price_book adds 1, for 18 cycles, while consecutive
-// message boundaries are at least 2 + 19 = 21 cycles apart (2 length bytes plus
-// the shortest table-touching message, a 19-byte Delete). Doing it in this
-// order makes the attribution correct even if that margin were ever eroded.
+// msgs_seen-1, THEN apply this cycle's boundary pulse -- so an update landing on
+// the very same cycle as the next boundary is still attributed to the message
+// that produced it.
+//
+// That ordering fixes the same-cycle case only. The margins beyond it:
+//   * Consecutive boundaries are 2 + len(next message) cycles apart (the two
+//     BinaryFILE/MoldUDP64 length bytes plus the next message's own bytes), more
+//     across a packet edge (20-byte MoldUDP64 header) or whenever in_ready
+//     deasserts. The shortest ITCH message in this feed is a 12-byte system
+//     event, so the true floor is 14 cycles -- not 21; 19 bytes (Delete) is the
+//     shortest *table-touching* message, which is a different question.
+//   * Worst-case boundary->update latency is ~18 cycles: 1 framer->decoder, up
+//     to 16 in the router (a REPLACE doing two MAX_PROBES-deep probe walks), 1
+//     in price_book.
+// 18 > 14, so a bound-by-construction argument does NOT hold: a maximally slow
+// REPLACE followed immediately by a 12-byte system event could in principle emit
+// after the next boundary and be attributed to msgs_seen-1 one too high. Two
+// things keep the runs sound. First, measurement: over 260,053 updates from 10M
+// real messages the observed maximum was 7 cycles, half the 14-cycle floor --
+// the worst case needs a REPLACE whose two probe walks both run to depth 8,
+// which a table with 6 probes of headroom never produces. Second, and more
+// importantly, misattribution is not silent: `n` is written into the trace and
+// compared against the golden model as data, so any skew fails the comparison
+// rather than hiding. Zero mismatches is therefore also the evidence that no
+// update was ever misattributed.
 //
 // `lat` is (cycle of upd_valid) - (cycle of the most recent msg_boundary),
 // i.e. end-of-message to book-snapshot latency in clock cycles.

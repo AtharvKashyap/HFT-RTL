@@ -63,16 +63,18 @@ def _unparsable(which: str, index: int, raw: str, exc: Exception, compared: int)
         "rtl": raw if which == "rtl" else None,
     }
     return {"compared": compared, "mismatches": 1,
-            "first_mismatch": detail, "reports": [detail]}
+            "first_mismatch": detail, "matched_before_first": compared,
+            "reports": [detail]}
 
 
 def compare_files(golden_path: str, rtl_path: str, max_report: int = 5) -> dict:
     """Compare two trace files line by line.
 
-    Returns a summary dict: compared, mismatches, first_mismatch (or None).
-    Stops reading at the first mismatch only if `max_report` is reached; it
-    keeps counting up to `max_report` reported divergences so a bisect run can
-    see whether a divergence is isolated or systemic.
+    Returns a summary dict: compared, mismatches, first_mismatch (or None),
+    reports, and matched_before_first (updates that matched *before* the first
+    divergence -- `compared` keeps rising past it, since comparison continues up
+    to `max_report` divergences so a bisect run can see whether a divergence is
+    isolated or systemic).
     """
     golden = _read_lines(golden_path)
     rtl = _read_lines(rtl_path)
@@ -80,6 +82,7 @@ def compare_files(golden_path: str, rtl_path: str, max_report: int = 5) -> dict:
     compared = 0
     mismatches = 0
     first_mismatch = None
+    matched_before_first = 0
     reports = []
 
     index = 0
@@ -101,6 +104,7 @@ def compare_files(golden_path: str, rtl_path: str, max_report: int = 5) -> dict:
             }
             if first_mismatch is None:
                 first_mismatch = detail
+                matched_before_first = compared
             reports.append(detail)
             break
 
@@ -123,6 +127,7 @@ def compare_files(golden_path: str, rtl_path: str, max_report: int = 5) -> dict:
                       "golden": g_raw, "rtl": r_raw}
             if first_mismatch is None:
                 first_mismatch = detail
+                matched_before_first = compared
             if len(reports) < max_report:
                 reports.append(detail)
             if mismatches >= max_report:
@@ -136,6 +141,7 @@ def compare_files(golden_path: str, rtl_path: str, max_report: int = 5) -> dict:
         "compared": compared,
         "mismatches": mismatches,
         "first_mismatch": first_mismatch,
+        "matched_before_first": matched_before_first,
         "reports": reports,
     }
 
@@ -160,8 +166,9 @@ def main(argv=None) -> int:
               f"(ignoring {', '.join(IGNORED_FIELDS)})")
         return 0
 
-    print(f"MISMATCH: {result['mismatches']} divergence(s) after "
-          f"{result['compared']} matching updates", file=sys.stderr)
+    print(f"MISMATCH: {result['mismatches']} divergence(s); first after "
+          f"{result['matched_before_first']} matching updates "
+          f"({result['compared']} matched in total)", file=sys.stderr)
     for rep in result["reports"]:
         print(f"  update #{rep['index']} ({rep['reason']}):", file=sys.stderr)
         print(f"    golden: {rep['golden']}", file=sys.stderr)
