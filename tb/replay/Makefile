@@ -38,9 +38,19 @@ GEN_HDR   := $(BUILD_DIR)/replay_symbols.svh
 # Waivers match tb/unit/Makefile:
 #  UNUSEDSIGNAL - decode views intentionally ignore ITCH fields the book doesn't need.
 #  UNUSEDPARAM  - book_pkg.sv is a fixed contract; some parameters are used by later modules.
+#  -MAKEFLAGS OPT_FAST=-O3 - verilator's generated makefile compiles the model
+#    with OPT_FAST, which defaults to -Os in verilated.mk and is appended AFTER
+#    anything -CFLAGS adds, so -CFLAGS "-O3" alone loses. Overriding it on the
+#    sub-make command line is what actually gets the model built at -O3, which
+#    is worth ~2x wall time on a several-hundred-million-cycle run.
 VFLAGS := --cc --exe --build -O3 --timescale 1ns/1ps -Wall \
           -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM \
-          -CFLAGS "-O3 -std=c++17" -LDFLAGS ""
+#    (An empty `-LDFLAGS ""` used to sit here. Do not put it back: verilator
+#    5.050 mis-parses an empty value for it and swallows the FOLLOWING option
+#    token, so `-LDFLAGS "" -MAKEFLAGS OPT_FAST=-O3` loses -MAKEFLAGS and then
+#    fails with "Cannot find file containing module: 'OPT_FAST=-O3'".)
+          -CFLAGS "-std=c++17" \
+          -MAKEFLAGS OPT_FAST=-O3
 
 IN  ?= /tmp/fpga_proj_vbuild/stream.mold
 OUT ?= /tmp/fpga_proj_vbuild/rtl.jsonl

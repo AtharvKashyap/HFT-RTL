@@ -79,6 +79,20 @@ def test_length_mismatch_is_caught(tmp_path):
     assert main([short, golden]) == 1
 
 
+def test_truncated_trace_reports_cleanly(tmp_path):
+    """A producer killed mid-write leaves a half line; that must be a reported
+    divergence with an ordinal, not a JSONDecodeError traceback."""
+    golden = _write(tmp_path / "golden.jsonl", [_line(0), _line(1)])
+    truncated = tmp_path / "rtl.jsonl"
+    truncated.write_text(_line(0) + "\n" + _line(1)[:40])
+
+    result = compare_files(golden, str(truncated))
+    assert result["mismatches"] == 1
+    assert result["first_mismatch"]["index"] == 1
+    assert "not valid JSON" in result["first_mismatch"]["reason"]
+    assert main([golden, str(truncated)]) == 1
+
+
 def test_deeper_level_difference_is_caught(tmp_path):
     g = json.loads(_line(0))
     r = json.loads(_line(0))

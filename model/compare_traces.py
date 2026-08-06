@@ -55,6 +55,17 @@ def _read_lines(path: str) -> Iterator[str]:
                 yield line
 
 
+def _unparsable(which: str, index: int, raw: str, exc: Exception, compared: int) -> dict:
+    detail = {
+        "index": index,
+        "reason": f"{which} trace line is not valid JSON ({exc}) -- truncated file?",
+        "golden": raw if which == "golden" else None,
+        "rtl": raw if which == "rtl" else None,
+    }
+    return {"compared": compared, "mismatches": 1,
+            "first_mismatch": detail, "reports": [detail]}
+
+
 def compare_files(golden_path: str, rtl_path: str, max_report: int = 5) -> dict:
     """Compare two trace files line by line.
 
@@ -93,8 +104,18 @@ def compare_files(golden_path: str, rtl_path: str, max_report: int = 5) -> dict:
             reports.append(detail)
             break
 
-        g_obj = _normalize(json.loads(g_raw))
-        r_obj = _normalize(json.loads(r_raw))
+        # A trace whose last line is truncated means the producer was killed
+        # mid-write; report that as a divergence at a known ordinal rather than
+        # letting a JSONDecodeError traceback escape after millions of good
+        # lines.
+        try:
+            g_obj = _normalize(json.loads(g_raw))
+        except ValueError as exc:
+            return _unparsable("golden", index, g_raw, exc, compared)
+        try:
+            r_obj = _normalize(json.loads(r_raw))
+        except ValueError as exc:
+            return _unparsable("rtl", index, r_raw, exc, compared)
 
         if g_obj != r_obj:
             mismatches += 1

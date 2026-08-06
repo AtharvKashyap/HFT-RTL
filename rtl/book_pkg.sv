@@ -1,16 +1,32 @@
 package book_pkg;
   parameter int NUM_SYMBOLS   = 16;
   parameter int N_LEVELS      = 8;
-  // Resting-order table address width (book_router). 20 bits = 1,048,576 slots.
-  // Sized from the real capture: 13.6M messages of AAPL + MSFT alone peak at
-  // 42,190 simultaneously live orders, which overruns a 16-bit (65,536-slot)
-  // table at the open -- an 8-deep probe window starts failing, dropping ADDs
-  // and every follow-up message for them, which is a hard divergence from the
-  // Python model. At 20 bits the same feed never exhausts the probe window.
-  // Sim-first: 2^20 x ~137b is trivial for Verilator. A real board port would
-  // not store the full 64-bit order id per slot -- it would keep a hash tag and
-  // move the table to external memory (phase-2 concern).
-  parameter int TABLE_ADDR_W  = 20;
+  // Resting-order table address width (book_router). 22 bits = 4,194,304 slots.
+  // Sized from the real capture, empirically, because an ADD whose 8-slot probe
+  // window is full is dropped (table_full_count) and every follow-up message for
+  // that order id then drops too -- a hard, permanent divergence from the Python
+  // model, which has no notion of probe geometry.
+  //
+  // Measurements over 10M messages of 12302019.NASDAQ_ITCH50 for the 8 replay
+  // symbols (peak 94,799 simultaneously live tracked orders), using a Python
+  // replica of this table's exact hash + linear probing + tombstone logic:
+  //   16 bits: probe window overflows repeatedly at the open.
+  //   20 bits: 1 overflow (deepest insert probe used: 7 of 8) -- confirmed by
+  //            the replay harness reporting table_full_count == 1, which cost
+  //            one book update and one wrong price level for the rest of the run.
+  //   21 bits: 0 overflows, deepest insert probe 4 of 8.
+  //   22 bits: 0 overflows, deepest insert probe 2 of 8 -- 6 probes of headroom.
+  // Occupancy is far below capacity in every case; the failures come from
+  // clustering, since near-sequential ITCH order ids XOR-fold to near-sequential
+  // slots and linear probing then piles them into contiguous runs. Extra address
+  // bits spread those runs out, which is why they are the effective lever.
+  //
+  // Sim-first: 2^22 x ~137b is ~80 MB in Verilator and adds a 4.2M-cycle
+  // post-reset clear sweep (~3 s), both negligible. A real board port would not
+  // store the full 64-bit order id per slot -- it would keep a hash tag, mix the
+  // hash to kill the sequential-id clustering, and move the table to external
+  // memory (phase-2 concern).
+  parameter int TABLE_ADDR_W  = 22;
   parameter int MAX_PROBES    = 8;
   parameter int BOOK_IDX_W    = $clog2(NUM_SYMBOLS);
 
