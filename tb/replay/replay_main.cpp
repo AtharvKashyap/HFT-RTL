@@ -162,7 +162,22 @@ Percentiles percentiles(std::vector<uint32_t>& v) {
 void usage() {
   std::fprintf(stderr,
       "usage: replay --in <stream.mold> --out <rtl.jsonl> [--progress N] "
-      "[--no-lat-hist]\n");
+      "[--no-lat-hist]\n"
+      "       replay --in <fuzz.mold> --out <rtl.jsonl> --fuzz "
+      "--tail-start <byte-offset> [--watchdog N]\n"
+      "\n"
+      "--fuzz mode (robustness): the input is expected to be a stream produced by\n"
+      "model/fuzz_stream.py -- an in-band-corrupted section followed by a clean\n"
+      "tail of valid messages starting at byte offset --tail-start (the tool's\n"
+      "own metadata sidecar reports this). Pass criteria, checked at exit:\n"
+      "  1. no hang: some observable output (msg_boundary, upd_valid, or any\n"
+      "     status counter) must change at least once every --watchdog cycles\n"
+      "     (default 10000) for as long as bytes remain.\n"
+      "  2. at least one error counter (gap/malformed/unknown/drop/table_full/\n"
+      "     reduce_miss/evict) is nonzero.\n"
+      "  3. at least one book update is emitted from bytes at or after "
+      "--tail-start.\n"
+      "Exit 0 = pass, 1 = fail (reason on stderr), 2 = usage error.\n");
 }
 
 }  // namespace
@@ -172,6 +187,10 @@ int main(int argc, char** argv) {
   const char* out_path = nullptr;
   uint64_t progress_every = 1000000;
   bool keep_lat = true;
+  bool fuzz = false;
+  uint64_t tail_start = 0;
+  bool have_tail_start = false;
+  uint64_t watchdog_limit = 10000;
 
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--in") && i + 1 < argc)        in_path = argv[++i];
@@ -179,9 +198,20 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--progress") && i + 1 < argc)
       progress_every = std::strtoull(argv[++i], nullptr, 10);
     else if (!std::strcmp(argv[i], "--no-lat-hist"))          keep_lat = false;
+    else if (!std::strcmp(argv[i], "--fuzz"))                 fuzz = true;
+    else if (!std::strcmp(argv[i], "--tail-start") && i + 1 < argc) {
+      tail_start = std::strtoull(argv[++i], nullptr, 10);
+      have_tail_start = true;
+    } else if (!std::strcmp(argv[i], "--watchdog") && i + 1 < argc)
+      watchdog_limit = std::strtoull(argv[++i], nullptr, 10);
     else { usage(); return 2; }
   }
   if (!in_path || !out_path) { usage(); return 2; }
+  if (fuzz && !have_tail_start) {
+    std::fprintf(stderr, "replay: --fuzz requires --tail-start <byte-offset>\n");
+    usage();
+    return 2;
+  }
 
   Verilated::traceEverOn(false);
   auto* top = new Vreplay_top;
@@ -195,6 +225,15 @@ int main(int argc, char** argv) {
   uint64_t orphan_updates = 0;   // upd_valid before any msg_boundary: must stay 0
   std::vector<uint32_t> lats;
   if (keep_lat) lats.reserve(1 << 20);
+
+  // --fuzz bookkeeping: a hang watchdog (armed only once bytes start flowing)
+  // and a before/after-tail split of update counts.
+  uint64_t last_progress_cycle = 0;
+  uint32_t prev_gap = 0, prev_malformed = 0, prev_unknown = 0, prev_drop = 0,
+           prev_table_full = 0, prev_reduce_miss = 0, prev_evict = 0;
+  bool     prev_eos = false;
+  uint64_t updates_before_tail = 0, updates_after_tail = 0;
+  bool     hang_detected = false;
 
   const auto t_start = std::chrono::steady_clock::now();
   uint64_t next_progress = progress_every;
@@ -246,11 +285,34 @@ int main(int argc, char** argv) {
         jsonl.endline();
         if (keep_lat) lats.push_back(static_cast<uint32_t>(lat));
         ++updates;
+        if (fuzz) {
+          if (feed.consumed() > tail_start) ++updates_after_tail;
+          else                              ++updates_before_tail;
+        }
       }
     }
     if (top->msg_boundary) {
       ++msgs_seen;
       last_boundary_cycle = cycle;
+    }
+    if (fuzz) {
+      const bool progressed =
+          top->msg_boundary || top->upd_valid ||
+          top->gap_count != prev_gap || top->malformed_count != prev_malformed ||
+          top->unknown_count != prev_unknown || top->drop_count != prev_drop ||
+          top->table_full_count != prev_table_full ||
+          top->reduce_miss_count != prev_reduce_miss ||
+          top->evict_count != prev_evict ||
+          (top->end_of_session && !prev_eos);
+      prev_gap = top->gap_count;
+      prev_malformed = top->malformed_count;
+      prev_unknown = top->unknown_count;
+      prev_drop = top->drop_count;
+      prev_table_full = top->table_full_count;
+      prev_reduce_miss = top->reduce_miss_count;
+      prev_evict = top->evict_count;
+      prev_eos = top->end_of_session;
+      if (progressed) last_progress_cycle = cycle;
     }
   };
 
@@ -263,6 +325,7 @@ int main(int argc, char** argv) {
   }
   std::fprintf(stderr, "replay: in_ready after %" PRIu64 " cycles "
                        "(post-reset table-clear sweep)\n", cycle);
+  last_progress_cycle = cycle;   // watchdog armed only once bytes can flow
 
   // ------------------------------------------------------------- stream feed
   uint8_t byte = 0;
@@ -276,6 +339,16 @@ int main(int argc, char** argv) {
     if (ready) feed.advance();
     sample();
     top->clk = 0; top->eval();
+
+    if (fuzz && (cycle - last_progress_cycle > watchdog_limit)) {
+      hang_detected = true;
+      std::fprintf(stderr, "replay: FUZZ WATCHDOG TRIPPED at cycle %" PRIu64
+                            ": no observable progress for %" PRIu64
+                            " cycles (bytes remain, %" PRIu64 " consumed of "
+                            "input)\n", cycle, cycle - last_progress_cycle,
+                   feed.consumed());
+      break;
+    }
 
     if (progress_every && msgs_seen >= next_progress) {
       const auto now = std::chrono::steady_clock::now();
@@ -335,6 +408,29 @@ int main(int argc, char** argv) {
   if (secs > 0) {
     std::printf("msgs/sec         : %.0f\n", static_cast<double>(msgs_seen) / secs);
     std::printf("cycles/sec       : %.0f\n", static_cast<double>(cycle) / secs);
+  }
+
+  if (fuzz) {
+    const uint32_t err_sum = top->gap_count + top->malformed_count +
+        top->unknown_count + top->drop_count + top->table_full_count +
+        top->reduce_miss_count + top->evict_count;
+    const bool errors_nonzero = err_sum > 0;
+    const bool tail_updates_ok = updates_after_tail > 0;
+    const bool orphan_ok = orphan_updates == 0;
+    const bool pass = !hang_detected && errors_nonzero && tail_updates_ok && orphan_ok;
+
+    std::printf("--- fuzz ---\n");
+    std::printf("tail_start_byte    : %" PRIu64 "\n", tail_start);
+    std::printf("hang_detected      : %s\n", hang_detected ? "YES" : "no");
+    std::printf("updates_before_tail: %" PRIu64 "\n", updates_before_tail);
+    std::printf("updates_after_tail : %" PRIu64 "\n", updates_after_tail);
+    std::printf("error_counters_sum : %u\n", err_sum);
+    std::printf("orphan_updates     : %" PRIu64 "\n", orphan_updates);
+    std::printf("fuzz result        : %s\n", pass ? "PASS" : "FAIL");
+
+    top->final();
+    delete top;
+    return pass ? 0 : 1;
   }
 
   top->final();

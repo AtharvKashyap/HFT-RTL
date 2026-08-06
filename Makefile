@@ -1,4 +1,4 @@
-.PHONY: test-model replay replay-headline
+.PHONY: test-model replay replay-headline fuzz
 
 test-model:
 	python3 -m pytest -q
@@ -13,3 +13,8 @@ replay:
 # The headline verification run: 10M real Nasdaq messages, zero mismatches.
 replay-headline:
 	scripts/run_replay.sh --limit 10000000
+
+# Fuzz robustness: corrupted-stream + clean-tail run, 3 seeds. See
+# docs/results.md ("Fuzz robustness") for what this checks.
+fuzz:
+	scripts/run_fuzz.sh

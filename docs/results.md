@@ -146,10 +146,56 @@ linear probing piles them into contiguous runs, so extra address bits (which
 spread the runs out) are the effective lever, not a bigger probe window. See the
 comment in `rtl/book_pkg.sv`.
 
+## Fuzz robustness
+
+`model/fuzz_stream.py` builds a seeded, corrupted MoldUDP64 byte stream: a
+"dirty" section of otherwise-valid ITCH traffic with byte flips inside message
+bodies and bogus declared lengths (≤ 50 bytes, resized so each message's
+length prefix always matches its own actual bytes — see the module docstring
+for why that matters), truncated to a random whole number of surviving
+packets, followed by a **clean tail of 1,000 valid messages under a fresh
+MoldUDP64 session**. `tb/replay/replay_main.cpp --fuzz --tail-start <N>` runs
+that stream against `itch_book_top` and checks three things: no hang (some
+observable output — a status counter, `msg_boundary`, or `upd_valid` — must
+change within 10,000 cycles at every point while bytes remain), error
+counters end up nonzero, and at least one book update is emitted from bytes at
+or after the tail boundary. Book-state equality with a clean run is
+explicitly not checked — resync semantics (recovering the *same* state a
+clean run would reach) are out of scope; what is verified is that the pipeline
+never stops decoding and keeps producing correct operations on new input
+after the disruption.
+
+| Seed | Bytes fed | `hang_detected` | `error_counters_sum` | `updates_before_tail` | `updates_after_tail` | Result |
+|---|---|---|---|---|---|---|
+| 1 | 40,116 | no | 565 | 141 | 699 | **PASS** |
+| 2 | 43,185 | no | 651 | 220 | 623 | **PASS** |
+| 3 | 42,105 | no | 596 | 213 | 647 | **PASS** |
+
+`gap_count` is 1 in every seed — the single, expected discontinuity where the
+tail's fresh session/sequence begins; `mold_framer` absorbs it and keeps
+consuming rather than treating it as fatal. `updates_after_tail > 0` in every
+run confirms the tail is not just passed through as bytes but actually
+decoded, routed, and reaches a price book again.
+
+A prior review of `itch_decoder` (Task 4) flagged that its write-index clamp
+for oversized messages (`widx` forced to 0 once `byte_cnt >= 40`) could in
+principle let an oversized message corrupt `msg_buf[0]`, and this fuzz's
+bogus lengths (up to 50 bytes) are exactly the kind of input that would
+exercise it. It does not: both the buffer write and the combinational `view`
+update are already gated by the identical `byte_cnt < LEN_MAX` condition the
+clamp's false branch corresponds to, so that branch never fires a write in
+the first place — it is dead code, not a live bug. Across all 3 fuzz seeds
+(including runs against the pre-fix construction of this test, which produced
+messages up to 50 bytes taking every code path in the decoder's final-byte
+logic) no spurious `out_valid` on garbage was observed, and `malformed_count`
+/ `unknown_count` behaved exactly as the "count and drop" contract predicts.
+Left as-is.
+
 ## Unit tests
 
-- `python3 -m pytest -q` — 45 passed (golden model, ITCH parsing, BinaryFILE
-  reader, MoldUDP64 wrapper, `--wrap-out` byte-identity, trace comparator).
+- `python3 -m pytest -q` — 53 passed (golden model, ITCH parsing, BinaryFILE
+  reader, MoldUDP64 wrapper, `--wrap-out` byte-identity, trace comparator,
+  fuzz-stream corruption/tail-integrity).
 - `make -C tb/unit TOP=<tb> run` for `tb_mold_framer`, `tb_itch_decoder`,
   `tb_price_book`, `tb_book_router`, `tb_itch_book_top` — all pass.
 
@@ -160,4 +206,14 @@ scripts/download_data.sh              # ~3.5 GB
 make test-model
 make replay LIMIT=1000000             # ~30 s sim
 make replay-headline                  # 10M messages, ~5 min sim
+
+# Fuzz robustness (3 seeds), see "Fuzz robustness" above:
+BIN="$(make -C tb/replay -s print-bin)"
+for seed in 1 2 3; do
+  python3 -m model.fuzz_stream --seed $seed --out build/fuzz_$seed.mold \
+      --meta build/fuzz_$seed.json
+  ts=$(python3 -c "import json; print(json.load(open('build/fuzz_$seed.json'))['tail_start'])")
+  "$BIN" --in build/fuzz_$seed.mold --out build/fuzz_rtl_$seed.jsonl \
+      --fuzz --tail-start "$ts"
+done
 ```
