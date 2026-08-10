@@ -41,10 +41,13 @@
 # for --limit >= 1,000,000. The 10k rung of the ladder legitimately produces no
 # updates at all (the first 10k records of the trading day are pre-open
 # administrative messages), so that one run needs an explicit `--min-updates 0`.
-# --min-orders defaults to 0 below 1,000,000 messages and 1 at or above it: the
+# --min-orders defaults to 0 below 1,000,000 messages and 20 at or above it: the
 # strategy is deliberately selective (hundreds of orders per 10M messages), so
 # the small rungs legitimately send nothing at all and only the large rungs can
-# assert that the order path did anything.
+# assert that the order path did anything. 20 is a floor well under the measured
+# counts (62 orders at 1M, 798 at 10M) but far enough above 1 that an order path
+# which collapsed to a handful of frames would fail the gate rather than clear
+# it.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -79,7 +82,7 @@ while [[ $# -gt 0 ]]; do
     --max-position) MAX_POSITION="$2"; shift 2 ;;
     --min-spacing)  MIN_SPACING="$2"; shift 2 ;;
     --collar-shift) COLLAR_SHIFT="$2"; shift 2 ;;
-    -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,50p' "$0"; exit 0 ;;   # the header comment block, ending at its last comment line
     *) echo "run_replay: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -90,7 +93,7 @@ if [[ -z "$MIN_UPDATES" ]]; then
   if (( LIMIT >= 1000000 )); then MIN_UPDATES=100; else MIN_UPDATES=1; fi
 fi
 if [[ -z "$MIN_ORDERS" ]]; then
-  if (( LIMIT >= 1000000 )); then MIN_ORDERS=1; else MIN_ORDERS=0; fi
+  if (( LIMIT >= 1000000 )); then MIN_ORDERS=20; else MIN_ORDERS=0; fi
 fi
 
 if [[ ! -f "$CAPTURE" ]]; then

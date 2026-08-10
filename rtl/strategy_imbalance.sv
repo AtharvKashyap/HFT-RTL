@@ -42,7 +42,7 @@ module strategy_imbalance #(
   input  book_pkg::book_update_t upd,
   input  logic                   upd_valid,
   output trade_pkg::gated_intent_t out,
-  output logic                     out_valid,   // 1-cycle pulse, cycle after upd_valid
+  output logic                     out_valid,   // 1-cycle pulse, cycle after an upd_valid that FIRED an intent
   output logic [31:0]              intent_count
 );
 

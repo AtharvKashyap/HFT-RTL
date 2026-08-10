@@ -178,3 +178,22 @@ def test_max_report_bounds_the_output(tmp_path):
     result = compare_files(golden, rtl, max_report=3)
     assert result["mismatches"] == 3
     assert len(result["reports"]) == 3
+
+
+def test_length_mismatch_still_reported_after_max_report(tmp_path):
+    """Hitting --max-report must not hide "the streams are different lengths".
+
+    Frame divergence and a count difference are separate diagnostics: an RTL
+    run that both corrupted early frames AND dropped orders later would, if
+    the report cap simply stopped reading, look like an ordinary handful of
+    frame mismatches.
+    """
+    golden = _write(tmp_path / "g.jsonl", [_golden(i) for i in range(10)])
+    rtl = _write(tmp_path / "r.jsonl",
+                 [_rtl(i, raw=_hex(i + 100)) for i in range(6)])
+
+    result = compare_files(golden, rtl, max_report=3)
+    # 3 frame mismatches (the cap) plus the stream-length difference.
+    assert result["mismatches"] == 4
+    assert any("ended early" in rep["reason"] for rep in result["reports"])
+    assert main([golden, rtl]) == 1

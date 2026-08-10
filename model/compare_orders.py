@@ -105,7 +105,9 @@ def compare_files(golden_path: str, rtl_path: str, max_report: int = 5) -> dict:
     reports, and matched_before_first (orders that matched *before* the first
     divergence). Comparison continues past the first divergence up to
     `max_report` of them, so an isolated slip is distinguishable from a
-    systemic one.
+    systemic one. On hitting that cap the remaining lines are still counted on
+    both sides, so a difference in stream LENGTH is reported even when the
+    per-frame comparison stopped early.
     """
     golden = _read_lines(golden_path)
     rtl = _read_lines(rtl_path)
@@ -164,6 +166,26 @@ def compare_files(golden_path: str, rtl_path: str, max_report: int = 5) -> dict:
             if len(reports) < max_report:
                 reports.append(detail)
             if mismatches >= max_report:
+                # Stop comparing frame by frame, but do NOT stop without
+                # answering "are the two streams even the same length?" --
+                # that is a different diagnostic (the RTL dropped or invented
+                # orders) and it would be hidden if the early exit simply
+                # left the remaining lines unread. Draining both iterators is
+                # cheap next to the comparison that just ran.
+                g_rest = sum(1 for _ in golden)
+                r_rest = sum(1 for _ in rtl)
+                if g_rest != r_rest:
+                    mismatches += 1
+                    which = "golden" if g_rest < r_rest else "rtl"
+                    reports.append({
+                        "index": index + 1 + min(g_rest, r_rest),
+                        "n": None,
+                        "reason": f"{which} order stream ended early "
+                                  f"({index + 1 + g_rest} golden vs "
+                                  f"{index + 1 + r_rest} rtl order lines in total)",
+                        "golden": None,
+                        "rtl": None,
+                    })
                 break
         else:
             compared += 1

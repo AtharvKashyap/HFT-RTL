@@ -72,10 +72,10 @@ CONFIG := SYMBOLS=$(SYMBOLS) $(GFLAGS)
 STAMP  := $(BUILD_DIR)/.build_config
 
 ifeq (,$(filter clean,$(MAKECMDGOALS)))
-_stamp_check := $(shell mkdir -p $(BUILD_DIR); \
-  printf '%s\n' '$(CONFIG)' | cmp -s - $(STAMP) || { \
-    printf '%s\n' '$(CONFIG)' > $(STAMP); \
-    rm -f $(GEN_HDR) $(BUILD_DIR)/$(BIN); \
+_stamp_check := $(shell mkdir -p "$(BUILD_DIR)"; \
+  printf '%s\n' '$(CONFIG)' | cmp -s - "$(STAMP)" || { \
+    printf '%s\n' '$(CONFIG)' > "$(STAMP)"; \
+    rm -f "$(GEN_HDR)" "$(BUILD_DIR)/$(BIN)"; \
   })
 endif
 

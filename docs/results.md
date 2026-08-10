@@ -44,9 +44,11 @@ degenerate stubs cannot match each other), and `run_replay.sh` passes
 A run that matched fewer updates than that exits 1 with a `VACUOUS:` message.
 The 10k rung is the one legitimate exception (see below) and needs an explicit
 `--min-updates 0`. The order comparator has the same gate under the name
-`--min-orders`, defaulting to 1 at `--limit ≥ 1,000,000` and 0 below it: the
+`--min-orders`, defaulting to 20 at `--limit ≥ 1,000,000` and 0 below it: the
 strategy is selective enough (hundreds of orders per 10M messages) that a small
-rung can legitimately send nothing.
+rung can legitimately send nothing, while the large rungs measure 62 orders at
+1M and 798 at 10M — so a floor of 20 sits comfortably under the real counts but
+still fails a run whose order path collapsed to a handful of frames.
 
 Ordinal alignment: `n` is the index over **all** messages read from the capture
 (parsed or not, tracked or not). In the RTL that ordinal is derived from the DUT's
@@ -213,6 +215,29 @@ The chain, one stage per cycle after the book update:
    (2-byte big-endian length + 49-byte Enter Order body) one byte per cycle,
    through a depth-4 FIFO that absorbs bursts.
 
+**Rate-counter coincidence semantics.** The risk gate's rate check counts book
+updates, and in the RTL a book update (`upd_valid`) can land on the very cycle
+an intent is being judged — a case the sequential golden model, which handles
+one event at a time, has no direct analogue for. The rule is that the RTL
+matches the model *by construction*, not by coincidence of tuning: the model
+counts update *k* and then judges the intent update *k* produced, and the RTL
+gets exactly that from the strategy's 1-cycle intent register — update *k* was
+already counted on the previous edge by the time its intent arrives. A
+`upd_valid` coincident with the intent is therefore a **later** book event
+(*k+1*), one the model has not reached yet, so it is *not* folded into the
+comparison: the intent is judged against the pre-coincident count, and after an
+accept (which clears the count) that coincident update survives the reset as a
+count of 1, exactly as the model's next iteration would count it. Both halves
+matter and they err in opposite directions — an earlier "increment the count
+before comparing" formulation was simultaneously one too high at the compare
+and one too low after an accept. It happened to produce identical results on
+this capture because no coincident intent ever sat on the rate boundary, which
+is precisely why the equivalence is now argued from the wiring rather than
+inferred from a matching run. `tb/unit/tb_risk_gate.sv` pins both halves with
+directed cases (a coincident update on an accepted intent must leave the count
+at 1; a coincident update on an intent whose pre-coincident count is
+`MIN_ORDER_SPACING − 1` must still rate-reject).
+
 ### Parameters
 
 Tuned on this capture; every default held, so the headline run passes no
@@ -273,7 +298,9 @@ exactly the same sequence.
 and a drop there would silently remove an accepted order from the wire. At
 `MIN_ORDER_SPACING = 10` the gate cannot accept two orders closer than 10 book
 updates apart, and a frame takes 51 cycles, so the FIFO is never under pressure
-on this workload — but the harness fails the run if it ever is, rather than
+on this workload — the depth-4 slack is a consequence of that parameter, not a
+bound that binds, and at `--min-spacing 1` drops become reachable. Either way
+the harness fails the run if `fifo_drop_count` is ever nonzero, rather than
 letting the order stream quietly shorten.
 
 ### Tick-to-trade latency
@@ -387,7 +414,7 @@ Left as-is.
 
 ## Unit tests
 
-- `python3 -m pytest -q` — 94 passed (golden model, ITCH parsing, BinaryFILE
+- `python3 -m pytest -q` — 95 passed (golden model, ITCH parsing, BinaryFILE
   reader, MoldUDP64 wrapper, `--wrap-out` byte-identity, the strategy, risk gate
   and OUCH encoder, `dump_trace --orders-out`, both comparators including their
   shape checks and non-vacuity gates, fuzz-stream corruption/tail-integrity).
@@ -396,13 +423,17 @@ Left as-is.
   `tb_strategy_imbalance`, `tb_risk_gate`, `tb_ouch_encoder`,
   `tb_tick_to_trade_top` — all pass.
 
-Functional coverage is tallied by hand in the two random-stimulus TBs (Verilator
-does not implement covergroups) and gated: `tb_price_book` requires all 14 bins
-of {ADD-new-level, ADD-aggregate, ADD-evict-9th, ADD-reject-full,
-REDUCE-partial, REDUCE-remove, REDUCE-miss} × {bid, ask} to be hit, and
-`tb_book_router` all 10 bins of {ADD, EXEC, CANCEL, DELETE, REPLACE} ×
-{hit, miss} (for ADD: tracked / untracked). An empty bin is a `$fatal`, not a
-warning.
+Functional coverage is tallied by hand in the five random-stimulus TBs
+(Verilator does not implement covergroups) and gated — an empty bin is a
+`$fatal`, not a warning:
+
+| TB | Bins | What must be hit |
+|---|---|---|
+| `tb_price_book` | 14 | {ADD-new-level, ADD-aggregate, ADD-evict-9th, ADD-reject-full, REDUCE-partial, REDUCE-remove, REDUCE-miss} × {bid, ask} |
+| `tb_book_router` | 10 | {ADD, EXEC, CANCEL, DELETE, REPLACE} × {hit, miss} (for ADD: tracked / untracked) |
+| `tb_strategy_imbalance` | 6 | fire-buy, fire-sell, suppress-cooldown, suppress-same-state, neutral-rearm, empty-side-suppress |
+| `tb_risk_gate` | 5 | accept plus each of the four reject paths (sanity, collar, rate, position) |
+| `tb_ouch_encoder` | 4 | side-B, side-S, queued-while-busy, immediate |
 
 ## Reproducing
 

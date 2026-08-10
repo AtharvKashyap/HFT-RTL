@@ -14,25 +14,23 @@ worst case. Verified in Verilator simulation only — no synthesis results yet.
 
 ## Architecture
 
+`tick_to_trade_top` is the whole pipeline; `itch_book_top` is the book stage
+*inside* it, and is also usable standalone (book updates and best bid/ask are
+brought out of `tick_to_trade_top` unchanged).
+
 ```
-                 ┌────────────────────────────────────────────────────────┐
-                 │                    itch_book_top                       │
- raw byte  ──▶ ┌──────────┐   ┌──────────┐   ┌───────────┐   ┌──────────┐ │
- stream        │ MoldUDP64│──▶│  ITCH    │──▶│ Order-ID  │──▶│ Price-   │─┼─▶ book updates /
- (1 B/cycle)   │  framer  │   │ decoder  │   │ table +   │   │ level    │ │   best bid-ask
-               └──────────┘   └──────────┘   │ symbol    │   │ books ×N │ │   (streaming)
-                                             │ filter    │   └──────────┘ │
-                                             └───────────┘                │
-                 └────────────────────────────────────────────────────────┘
-                                              │
-                                              ▼
-                 ┌────────────────────────────────────────────────────────┐
-                 │                  tick_to_trade_top                     │
-                 │  ┌──────────────┐   ┌───────────┐   ┌───────────────┐  │
-    book updates │  │  strategy_   │──▶│ risk_gate │──▶│ ouch_encoder  │──┼─▶ OUCH 4.2
-    (from above) ─┼─▶│  imbalance   │   │           │   │ (depth-4 FIFO)│  │  Enter Order
-                 │  └──────────────┘   └───────────┘   └───────────────┘  │  bytes
-                 └────────────────────────────────────────────────────────┘
+              ┌─ tick_to_trade_top ────────────────────────────────────┐
+              │  ┌─ itch_book_top ──────────────────────────────────┐  │
+raw ITCH  ──▶ ┼──│ MoldUDP64 ─▶ ITCH ─▶ order-ID table ─▶ price_book │─┼─▶ book updates /
+bytes         │  │  framer     decode   + symbol filter    ×16      │  │   best bid-ask
+(1 B/cycle)   │  └──────────────────────────────────────────────────┘  │
+              │            book update │                               │
+              │                        ▼                               │
+              │  ┌──────────────┐   ┌───────────┐   ┌──────────────┐   │
+              │  │  strategy_   │──▶│ risk_gate │──▶│ ouch_encoder │───┼─▶ OUCH 4.2
+              │  │  imbalance   │   │           │   │(depth-4 FIFO)│   │   Enter Order
+              │  └──────────────┘   └───────────┘   └──────────────┘   │   bytes
+              └────────────────────────────────────────────────────────┘
 ```
 
 - **`mold_framer`** — strips MoldUDP64 framing (session, sequence, message
@@ -90,7 +88,7 @@ disk for the capture.
 
 ```bash
 scripts/download_data.sh                  # 3.5 GB Nasdaq sample, one-time
-make test-model                           # Python golden model suite, 94 tests
+make test-model                           # Python golden model suite, 95 tests
 for tb in tb_mold_framer tb_itch_decoder tb_price_book tb_book_router \
           tb_itch_book_top tb_strategy_imbalance tb_risk_gate \
           tb_ouch_encoder tb_tick_to_trade_top; do
