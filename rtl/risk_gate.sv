@@ -26,11 +26,12 @@
 // resolution: the rate counter's increment for the coincident upd_valid is
 // applied BEFORE the rate comparison for that same cycle's in_valid, i.e. an
 // intent is judged against the incremented count. This is exactly the model
-// wiring rule from Task 4 (on_update() called before on_intent() for the same
-// event) -- calling on_update() first means the Python counter the intent
-// sees has already been bumped, which is what letting the increment land
-// before the comparison reproduces here. Both sides of the equivalence live
-// in one always_ff below: the unconditional `if (upd_valid) rate_q <= ...`
+// wiring rule in model/dump_trace.py (on_update() called before on_intent()
+// for the same event) -- calling on_update() first means the Python counter
+// the intent sees has already been bumped, which is what letting the
+// increment land before the comparison reproduces here. Both sides of the
+// equivalence live in one always_ff below: the unconditional
+// `if (upd_valid) rate_q <= ...`
 // runs first in program order, and the combinational `rate_eff` used by the
 // checks already reflects that same increment when upd_valid is high this
 // cycle.

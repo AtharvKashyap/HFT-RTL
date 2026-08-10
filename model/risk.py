@@ -1,11 +1,10 @@
 """Python golden pre-trade risk gate.
 
-Implements the per-symbol pre-trade risk checks per the verbatim risk-gate
-semantics contract in the project's global context. Consumes intents from
-the strategy (Task 2), each carrying bid0/ask0 sideband. Checks run in a
-fixed order that is a hard contract (an RTL risk_gate module mirrors this
-exactly), and exactly one reject counter increments per rejection -- the
-counter for the FIRST failing check:
+Implements the per-symbol pre-trade risk checks. Consumes intents from the
+strategy (model/strategy.py), each carrying bid0/ask0 sideband. Checks run
+in a fixed order that is a hard contract (an RTL risk_gate module mirrors
+this exactly), and exactly one reject counter increments per rejection --
+the counter for the FIRST failing check:
 
 1. sanity: reject unless bid0 != 0 and ask0 != 0 and bid0 < ask0.
 2. collar: mid = (bid0+ask0)>>1; reject if |price-mid| > (mid>>collar_shift).
