@@ -42,8 +42,8 @@
 # updates at all (the first 10k records of the trading day are pre-open
 # administrative messages), so that one run needs an explicit `--min-updates 0`.
 # --min-orders defaults to 0 below 1,000,000 messages and 1 at or above it: the
-# strategy is deliberately selective (tens of orders per 10M messages), so the
-# small rungs legitimately send nothing at all and only the large rungs can
+# strategy is deliberately selective (hundreds of orders per 10M messages), so
+# the small rungs legitimately send nothing at all and only the large rungs can
 # assert that the order path did anything.
 set -euo pipefail
 

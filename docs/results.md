@@ -241,6 +241,12 @@ harness build — so the two can never be tuned apart.
 | `fifo_drop_count` | 0 |
 | Sim wall time (whole pipeline) | 236.97 s, 42,200 msgs/sec |
 
+The two 10M-message wall-clock figures in this document (298.12 s in the
+headline run above, 236.97 s here) are separate measurements taken at
+different times, not a regression in either direction — the cycle counts they
+correspond to (356,357,526) are identical, so the wall-time gap is machine
+load variance between runs, not a change in what got simulated.
+
 Reject breakdown of the 1,029 intents that did not become orders:
 
 | Check | Rejects | Reading |
