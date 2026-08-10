@@ -1,4 +1,4 @@
-// replay_main.cpp -- Verilator C++ replay harness for itch_book_top.
+// replay_main.cpp -- Verilator C++ replay harness for tick_to_trade_top.
 //
 // Streams a pre-wrapped MoldUDP64 byte file (produced by
 // `model/dump_trace.py --wrap-out`, i.e. byte-identical to what the Python
@@ -45,6 +45,30 @@
 // `lat` is (cycle of upd_valid) - (cycle of the most recent msg_boundary),
 // i.e. end-of-message to book-snapshot latency in clock cycles.
 //
+// ORDER STREAM (--orders-out)
+// ---------------------------
+// The DUT also emits OUCH 4.2 Enter Order frames byte-serially on
+// ouch_valid/ouch_data, with ouch_last on the final byte and frame_start on
+// the first. The harness reassembles each frame and writes one JSONL line:
+//
+//   {"n": <msg ordinal at frame_start>, "raw": "<hex>", "lat": <cycles>}
+//
+// `n` uses exactly the same rule as a book update -- msgs_seen-1, consumed
+// before this cycle's boundary pulse is applied. The margin is wider here than
+// for book updates: an order can only follow the update that triggered it, so
+// its boundary->frame_start distance is the update latency plus the
+// strategy(1) + risk(1) + encoder-pop(1) cycles, observed at 9 cycles max on
+// the 10M run against the same 14-cycle floor on message spacing. As with
+// updates, this is not merely an argument: `n` is written into the trace and
+// compared against the golden model, so any skew fails the comparison instead
+// of hiding. `orphan_orders` (frame_start before the first msg_boundary)
+// counts what the ordinal rule cannot express at all and must stay 0.
+//
+// `raw` is compared byte-for-byte against model/ouch.py's frame, which
+// includes the order token -- so the RTL's free-running token counter and the
+// model's must stay in lockstep, i.e. the two must accept exactly the same
+// orders in exactly the same sequence.
+//
 // in_ready: itch_book_top holds it low for the 2**TABLE_ADDR_W-cycle post-reset
 // table-clear sweep and any byte offered while it is low is dropped, not
 // buffered, so the harness waits for it before feeding byte 0. It is sampled
@@ -61,6 +85,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -126,6 +151,11 @@ class JsonlWriter {
     while (i) out_.push_back(tmp[--i]);
   }
   void lit(const char* s) { out_.append(s); }
+  void hexbyte(uint8_t b) {
+    static const char kHex[] = "0123456789abcdef";
+    out_.push_back(kHex[b >> 4]);
+    out_.push_back(kHex[b & 0xf]);
+  }
   void endline() {
     out_.push_back('\n');
     if (out_.size() >= (1u << 20)) flush();
@@ -161,8 +191,8 @@ Percentiles percentiles(std::vector<uint32_t>& v) {
 
 void usage() {
   std::fprintf(stderr,
-      "usage: replay --in <stream.mold> --out <rtl.jsonl> [--progress N] "
-      "[--no-lat-hist]\n"
+      "usage: replay --in <stream.mold> --out <rtl.jsonl> "
+      "[--orders-out <rtl_orders.jsonl>] [--progress N] [--no-lat-hist]\n"
       "       replay --in <fuzz.mold> --out <rtl.jsonl> --fuzz "
       "--tail-start <byte-offset> [--watchdog N]\n"
       "\n"
@@ -185,6 +215,7 @@ void usage() {
 int main(int argc, char** argv) {
   const char* in_path = nullptr;
   const char* out_path = nullptr;
+  const char* orders_path = nullptr;
   uint64_t progress_every = 1000000;
   bool keep_lat = true;
   bool fuzz = false;
@@ -195,6 +226,8 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--in") && i + 1 < argc)        in_path = argv[++i];
     else if (!std::strcmp(argv[i], "--out") && i + 1 < argc)  out_path = argv[++i];
+    else if (!std::strcmp(argv[i], "--orders-out") && i + 1 < argc)
+      orders_path = argv[++i];
     else if (!std::strcmp(argv[i], "--progress") && i + 1 < argc)
       progress_every = std::strtoull(argv[++i], nullptr, 10);
     else if (!std::strcmp(argv[i], "--no-lat-hist"))          keep_lat = false;
@@ -217,6 +250,8 @@ int main(int argc, char** argv) {
   auto* top = new Vreplay_top;
   ByteFeed feed(in_path);
   JsonlWriter jsonl(out_path);
+  std::unique_ptr<JsonlWriter> orders_jsonl;
+  if (orders_path) orders_jsonl.reset(new JsonlWriter(orders_path));
 
   uint64_t cycle = 0;
   uint64_t msgs_seen = 0;
@@ -225,6 +260,20 @@ int main(int argc, char** argv) {
   uint64_t orphan_updates = 0;   // upd_valid before any msg_boundary: must stay 0
   std::vector<uint32_t> lats;
   if (keep_lat) lats.reserve(1 << 20);
+
+  // ------------------------------------------------------------ order stream
+  // A frame is opened by frame_start and closed by ouch_last; the bytes in
+  // between are the wire frame, buffered so the line can carry `raw` whole.
+  uint64_t frames = 0;              // frames completed (frame_start..ouch_last)
+  uint64_t ouch_bytes = 0;
+  uint64_t orphan_orders = 0;       // frame_start before any msg_boundary
+  uint64_t truncated_frames = 0;    // stream ended mid-frame: must stay 0
+  bool     frame_open = false;
+  uint64_t frame_n = 0, frame_lat = 0;
+  std::vector<uint8_t> frame_buf;
+  frame_buf.reserve(64);
+  std::vector<uint32_t> order_lats;
+  if (keep_lat) order_lats.reserve(1 << 12);
 
   // --fuzz bookkeeping: a hang watchdog (armed only once bytes start flowing)
   // and a before/after-tail split of update counts.
@@ -291,6 +340,40 @@ int main(int argc, char** argv) {
         }
       }
     }
+    // Order stream. frame_start is asserted on the same cycle as the frame's
+    // first ouch_valid byte, so it must be handled first; and, like upd_valid
+    // above, both are consumed BEFORE this cycle's boundary pulse is applied.
+    if (top->frame_start) {
+      if (msgs_seen == 0) {
+        ++orphan_orders;
+        frame_open = false;
+      } else {
+        frame_open = true;
+        frame_n = msgs_seen - 1;
+        frame_lat = cycle - last_boundary_cycle;
+        frame_buf.clear();
+      }
+    }
+    if (top->ouch_valid) {
+      ++ouch_bytes;
+      if (frame_open) frame_buf.push_back(static_cast<uint8_t>(top->ouch_data));
+      if (top->ouch_last && frame_open) {
+        ++frames;
+        if (orders_jsonl) {
+          orders_jsonl->lit("{\"n\": ");
+          orders_jsonl->num(frame_n);
+          orders_jsonl->lit(", \"raw\": \"");
+          for (uint8_t b : frame_buf) orders_jsonl->hexbyte(b);
+          orders_jsonl->lit("\", \"lat\": ");
+          orders_jsonl->num(frame_lat);
+          orders_jsonl->lit("}");
+          orders_jsonl->endline();
+        }
+        if (keep_lat) order_lats.push_back(static_cast<uint32_t>(frame_lat));
+        frame_open = false;
+      }
+    }
+
     if (top->msg_boundary) {
       ++msgs_seen;
       last_boundary_cycle = cycle;
@@ -372,7 +455,14 @@ int main(int argc, char** argv) {
     top->clk = 0; top->eval();
   }
 
+  // A frame still open after DRAIN_CYCLES means the stream stopped mid-frame:
+  // the partial frame is deliberately NOT written (a half frame would fail the
+  // comparator's shape check as noise rather than as this specific fault), but
+  // it is counted and reported.
+  if (frame_open) { truncated_frames = 1; frame_open = false; }
+
   jsonl.flush();
+  if (orders_jsonl) orders_jsonl->flush();
 
   const auto t_end = std::chrono::steady_clock::now();
   const double secs = std::chrono::duration<double>(t_end - t_start).count();
@@ -388,6 +478,10 @@ int main(int argc, char** argv) {
   std::printf("updates          : %" PRIu64 "\n", updates);
   std::printf("cycles           : %" PRIu64 "\n", cycle);
   std::printf("orphan updates   : %" PRIu64 "\n", orphan_updates);
+  std::printf("orders           : %" PRIu64 "\n", frames);
+  std::printf("ouch bytes       : %" PRIu64 "\n", ouch_bytes);
+  std::printf("orphan orders    : %" PRIu64 "\n", orphan_orders);
+  std::printf("truncated frames : %" PRIu64 "\n", truncated_frames);
   std::printf("--- counters ---\n");
   std::printf("gap_count        : %u\n", top->gap_count);
   std::printf("malformed_count  : %u\n", top->malformed_count);
@@ -397,9 +491,28 @@ int main(int argc, char** argv) {
   std::printf("reduce_miss_count: %u\n", top->reduce_miss_count);
   std::printf("evict_count      : %u\n", top->evict_count);
   std::printf("end_of_session   : %u\n", top->end_of_session);
+  // Machine-readable for scripts/run_replay.sh, which asserts each of these
+  // against the golden model's own summary line.
+  std::printf("--- trade counters ---\n");
+  std::printf("intent_count        : %u\n", top->intent_count);
+  std::printf("accept_count        : %u\n", top->accept_count);
+  std::printf("sanity_reject_count : %u\n", top->sanity_reject_count);
+  std::printf("collar_reject_count : %u\n", top->collar_reject_count);
+  std::printf("rate_reject_count   : %u\n", top->rate_reject_count);
+  std::printf("pos_reject_count    : %u\n", top->pos_reject_count);
+  std::printf("order_count         : %u\n", top->order_count);
+  std::printf("fifo_drop_count     : %u\n", top->fifo_drop_count);
   std::printf("--- latency (message boundary -> update, cycles) ---\n");
   if (keep_lat && !lats.empty()) {
     std::printf("min=%u median=%u p99=%u max=%u\n", p.min, p.median, p.p99, p.max);
+  } else {
+    std::printf("(not collected)\n");
+  }
+  Percentiles op = percentiles(order_lats);
+  std::printf("--- tick-to-trade latency (message boundary -> frame_start, cycles) ---\n");
+  if (keep_lat && !order_lats.empty()) {
+    std::printf("min=%u median=%u p99=%u max=%u\n",
+                op.min, op.median, op.p99, op.max);
   } else {
     std::printf("(not collected)\n");
   }
@@ -416,7 +529,7 @@ int main(int argc, char** argv) {
         top->reduce_miss_count + top->evict_count;
     const bool errors_nonzero = err_sum > 0;
     const bool tail_updates_ok = updates_after_tail > 0;
-    const bool orphan_ok = orphan_updates == 0;
+    const bool orphan_ok = orphan_updates == 0 && orphan_orders == 0;
     const bool pass = !hang_detected && errors_nonzero && tail_updates_ok && orphan_ok;
 
     std::printf("--- fuzz ---\n");
@@ -426,6 +539,7 @@ int main(int argc, char** argv) {
     std::printf("updates_after_tail : %" PRIu64 "\n", updates_after_tail);
     std::printf("error_counters_sum : %u\n", err_sum);
     std::printf("orphan_updates     : %" PRIu64 "\n", orphan_updates);
+    std::printf("orphan_orders      : %" PRIu64 "\n", orphan_orders);
     std::printf("fuzz result        : %s\n", pass ? "PASS" : "FAIL");
 
     top->final();
@@ -433,13 +547,42 @@ int main(int argc, char** argv) {
     return pass ? 0 : 1;
   }
 
+  const uint32_t dut_order_count = top->order_count;
+  const uint32_t dut_fifo_drops  = top->fifo_drop_count;
   top->final();
   delete top;
 
+  int rc = 0;
   if (orphan_updates) {
     std::fprintf(stderr, "replay: %" PRIu64 " update(s) arrived before any message "
                          "boundary -- ordinal alignment is broken\n", orphan_updates);
-    return 1;
+    rc = 1;
   }
-  return 0;
+  if (orphan_orders) {
+    std::fprintf(stderr, "replay: %" PRIu64 " order frame(s) started before any "
+                         "message boundary -- ordinal alignment is broken\n",
+                 orphan_orders);
+    rc = 1;
+  }
+  if (truncated_frames) {
+    std::fprintf(stderr, "replay: the stream ended mid-frame; the trailing partial "
+                         "OUCH frame was not written\n");
+    rc = 1;
+  }
+  // The DUT's own order_count and the number of frames the harness reassembled
+  // are independent measurements of the same thing; a split between them means
+  // bytes were lost on the way out, which the trace comparison alone would
+  // report only as a length mismatch.
+  if (frames != dut_order_count) {
+    std::fprintf(stderr, "replay: reassembled %" PRIu64 " frame(s) but the DUT's "
+                         "order_count is %u\n", frames, dut_order_count);
+    rc = 1;
+  }
+  if (dut_fifo_drops) {
+    std::fprintf(stderr, "replay: %u accepted order(s) were dropped by the "
+                         "encoder FIFO -- the order stream is incomplete\n",
+                 dut_fifo_drops);
+    rc = 1;
+  }
+  return rc;
 }

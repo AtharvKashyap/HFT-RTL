@@ -1,7 +1,7 @@
-# Verilator C++ replay harness for itch_book_top.
+# Verilator C++ replay harness for tick_to_trade_top.
 #
 #   make              # build the harness binary
-#   make run IN=stream.mold OUT=rtl.jsonl
+#   make run IN=stream.mold OUT=rtl.jsonl ORDERS=rtl_orders.jsonl
 #   make clean
 #
 # SYMBOLS is fixed AT VERILATE TIME. `verilator -G` cannot set an unpacked
@@ -12,6 +12,23 @@
 # `model/dump_trace.py --symbols` for book_idx to equal symbol_idx. Override
 # with e.g. `make SYMBOLS=AAPL,MSFT` (rebuilds the header and re-verilates).
 SYMBOLS ?= AAPL,MSFT,SPY,QQQ,TSLA,NVDA,AMD,INTC
+
+# Strategy/risk scalar parameters. These ARE settable by `verilator -G`, and
+# replay_top re-declares them as top-level parameters for exactly that reason.
+# The defaults below must stay equal to the trade_pkg *_DEF values and to
+# model/dump_trace.py's own defaults -- scripts/run_replay.sh passes the same
+# numbers to both sides of the comparison, so a divergence here would show up
+# as an order mismatch rather than as a silent difference in what was tuned.
+THRESH_LOG2       ?= 2
+COOLDOWN_UPDATES  ?= 16
+ORDER_SHARES      ?= 100
+MAX_POSITION      ?= 1000
+MIN_ORDER_SPACING ?= 10
+COLLAR_SHIFT      ?= 3
+
+GFLAGS := -GTHRESH_LOG2=$(THRESH_LOG2) -GCOOLDOWN_UPDATES=$(COOLDOWN_UPDATES) \
+          -GORDER_SHARES=$(ORDER_SHARES) -GMAX_POSITION=$(MAX_POSITION) \
+          -GMIN_ORDER_SPACING=$(MIN_ORDER_SPACING) -GCOLLAR_SHIFT=$(COLLAR_SHIFT)
 
 TOP := replay_top
 BIN := replay
@@ -35,6 +52,15 @@ RTL_NAMES := $(addprefix rtl/,$(notdir $(RTL)))
 # dependency files, where they no longer resolve.)
 BUILD_DIR ?= /tmp/fpga_proj_vbuild/replay
 GEN_HDR   := $(BUILD_DIR)/replay_symbols.svh
+
+# Configuration stamp. SYMBOLS and the -G parameters are baked in at verilate
+# time but arrive on the make command line, which changes no file's timestamp
+# -- so without this, `make SYMBOLS=AAPL` after a default build would happily
+# reuse the previous binary and silently verify the wrong configuration. The
+# stamp file holds the current configuration string and is rewritten only when
+# it actually changes, so it triggers a rebuild exactly when one is needed.
+CONFIG := SYMBOLS=$(SYMBOLS) $(GFLAGS)
+STAMP  := $(BUILD_DIR)/.build_config
 
 # Waivers match tb/unit/Makefile:
 #  UNUSEDSIGNAL - decode views intentionally ignore ITCH fields the book doesn't need.
@@ -61,10 +87,11 @@ VFLAGS := --cc --exe --build -O3 --timescale 1ns/1ps -Wall \
           -CFLAGS "-std=c++17" \
           -MAKEFLAGS OPT_FAST=-O3
 
-IN  ?= /tmp/fpga_proj_vbuild/stream.mold
-OUT ?= /tmp/fpga_proj_vbuild/rtl.jsonl
+IN     ?= /tmp/fpga_proj_vbuild/stream.mold
+OUT    ?= /tmp/fpga_proj_vbuild/rtl.jsonl
+ORDERS ?= /tmp/fpga_proj_vbuild/rtl_orders.jsonl
 
-.PHONY: all run print-bin clean
+.PHONY: all run print-bin clean force
 
 all: $(BUILD_DIR)/$(BIN)
 
@@ -74,19 +101,23 @@ all: $(BUILD_DIR)/$(BIN)
 print-bin:
 	@echo $(BUILD_DIR)/$(BIN)
 
-$(GEN_HDR): ../../scripts/gen_symbols.py Makefile
+$(STAMP): force
+	@mkdir -p $(BUILD_DIR)
+	@printf '%s\n' '$(CONFIG)' | cmp -s - $@ || printf '%s\n' '$(CONFIG)' > $@
+
+$(GEN_HDR): ../../scripts/gen_symbols.py Makefile $(STAMP)
 	mkdir -p $(BUILD_DIR)
 	python3 ../../scripts/gen_symbols.py '$(SYMBOLS)' > $@
 
-$(BUILD_DIR)/$(BIN): $(GEN_HDR) replay_top.sv replay_main.cpp $(RTL)
+$(BUILD_DIR)/$(BIN): $(GEN_HDR) $(STAMP) replay_top.sv replay_main.cpp $(RTL)
 	mkdir -p $(BUILD_DIR)
 	ln -sfn "$(abspath ../../rtl)" $(BUILD_DIR)/rtl
 	cp replay_main.cpp replay_top.sv $(BUILD_DIR)/
-	cd $(BUILD_DIR) && verilator $(VFLAGS) -Irtl -I. --Mdir . \
+	cd $(BUILD_DIR) && verilator $(VFLAGS) $(GFLAGS) -Irtl -I. --Mdir . \
 	    $(RTL_NAMES) replay_top.sv --top $(TOP) replay_main.cpp -o $(BIN)
 
 run: $(BUILD_DIR)/$(BIN)
-	$(BUILD_DIR)/$(BIN) --in "$(IN)" --out "$(OUT)"
+	$(BUILD_DIR)/$(BIN) --in "$(IN)" --out "$(OUT)" --orders-out "$(ORDERS)"
 
 clean:
 	rm -rf obj_dir $(BUILD_DIR)
