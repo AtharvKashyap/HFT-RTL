@@ -1,7 +1,7 @@
-# Verilator C++ replay harness for itch_book_top.
+# Verilator C++ replay harness for tick_to_trade_top.
 #
 #   make              # build the harness binary
-#   make run IN=stream.mold OUT=rtl.jsonl
+#   make run IN=stream.mold OUT=rtl.jsonl ORDERS=rtl_orders.jsonl
 #   make clean
 #
 # SYMBOLS is fixed AT VERILATE TIME. `verilator -G` cannot set an unpacked
@@ -13,15 +13,33 @@
 # with e.g. `make SYMBOLS=AAPL,MSFT` (rebuilds the header and re-verilates).
 SYMBOLS ?= AAPL,MSFT,SPY,QQQ,TSLA,NVDA,AMD,INTC
 
+# Strategy/risk scalar parameters. These ARE settable by `verilator -G`, and
+# replay_top re-declares them as top-level parameters for exactly that reason.
+# The defaults below must stay equal to the trade_pkg *_DEF values and to
+# model/dump_trace.py's own defaults -- scripts/run_replay.sh passes the same
+# numbers to both sides of the comparison, so a divergence here would show up
+# as an order mismatch rather than as a silent difference in what was tuned.
+THRESH_LOG2       ?= 2
+COOLDOWN_UPDATES  ?= 16
+ORDER_SHARES      ?= 100
+MAX_POSITION      ?= 1000
+MIN_ORDER_SPACING ?= 10
+COLLAR_SHIFT      ?= 3
+
+GFLAGS := -GTHRESH_LOG2=$(THRESH_LOG2) -GCOOLDOWN_UPDATES=$(COOLDOWN_UPDATES) \
+          -GORDER_SHARES=$(ORDER_SHARES) -GMAX_POSITION=$(MAX_POSITION) \
+          -GMIN_ORDER_SPACING=$(MIN_ORDER_SPACING) -GCOLLAR_SHIFT=$(COLLAR_SHIFT)
+
 TOP := replay_top
 BIN := replay
 
-# book_pkg.sv must come first (it declares the package everything imports) and
-# must not be repeated by the wildcard -- a duplicate file triggers MODDUP.
+# Packages must come before anything that imports them, and trade_pkg itself
+# references book_pkg, so the order is book_pkg, trade_pkg, then the rest.
+# Neither may be repeated by the wildcard -- a duplicate file triggers MODDUP.
 # RTL is the prerequisite list (relative to this directory); RTL_NAMES is the
 # same set as bare filenames, used inside the build directory (see below).
-RTL := ../../rtl/book_pkg.sv \
-       $(filter-out ../../rtl/book_pkg.sv,$(wildcard ../../rtl/*.sv))
+PKGS := ../../rtl/book_pkg.sv ../../rtl/trade_pkg.sv
+RTL  := $(PKGS) $(filter-out $(PKGS),$(wildcard ../../rtl/*.sv))
 RTL_NAMES := $(addprefix rtl/,$(notdir $(RTL)))
 
 # Neither verilator nor the makefile it generates can cope with a source path
@@ -34,6 +52,32 @@ RTL_NAMES := $(addprefix rtl/,$(notdir $(RTL)))
 # dependency files, where they no longer resolve.)
 BUILD_DIR ?= /tmp/fpga_proj_vbuild/replay
 GEN_HDR   := $(BUILD_DIR)/replay_symbols.svh
+
+# Configuration stamp. SYMBOLS and the -G parameters are baked in at verilate
+# time but arrive on the make command line, which changes no file's timestamp
+# -- so without this, `make SYMBOLS=AAPL` after a default build would happily
+# reuse the previous binary and silently verify the wrong configuration. (Not a
+# hypothetical: building at -GTHRESH_LOG2=3 and then rebuilding at the default
+# kept the 3 binary, and the 300k replay failed with 15 intents instead of 22.)
+#
+# The check runs at PARSE time, via $(shell ...), and works by DELETING the
+# generated header and the binary when the configuration string has changed.
+# Both details are load-bearing. A normal target whose recipe rewrites a stamp
+# file does not work here: make 3.81 (the system make on macOS) stats a target
+# before remaking its prerequisites and does not re-stat afterwards, so a stamp
+# rewritten -- or an output deleted -- during the same invocation is noticed
+# only on the NEXT one. Deleting before any target is considered cannot be
+# missed.
+CONFIG := SYMBOLS=$(SYMBOLS) $(GFLAGS)
+STAMP  := $(BUILD_DIR)/.build_config
+
+ifeq (,$(filter clean,$(MAKECMDGOALS)))
+_stamp_check := $(shell mkdir -p "$(BUILD_DIR)"; \
+  printf '%s\n' '$(CONFIG)' | cmp -s - "$(STAMP)" || { \
+    printf '%s\n' '$(CONFIG)' > "$(STAMP)"; \
+    rm -f "$(GEN_HDR)" "$(BUILD_DIR)/$(BIN)"; \
+  })
+endif
 
 # Waivers match tb/unit/Makefile:
 #  UNUSEDSIGNAL - decode views intentionally ignore ITCH fields the book doesn't need.
@@ -60,8 +104,9 @@ VFLAGS := --cc --exe --build -O3 --timescale 1ns/1ps -Wall \
           -CFLAGS "-std=c++17" \
           -MAKEFLAGS OPT_FAST=-O3
 
-IN  ?= /tmp/fpga_proj_vbuild/stream.mold
-OUT ?= /tmp/fpga_proj_vbuild/rtl.jsonl
+IN     ?= /tmp/fpga_proj_vbuild/stream.mold
+OUT    ?= /tmp/fpga_proj_vbuild/rtl.jsonl
+ORDERS ?= /tmp/fpga_proj_vbuild/rtl_orders.jsonl
 
 .PHONY: all run print-bin clean
 
@@ -81,11 +126,11 @@ $(BUILD_DIR)/$(BIN): $(GEN_HDR) replay_top.sv replay_main.cpp $(RTL)
 	mkdir -p $(BUILD_DIR)
 	ln -sfn "$(abspath ../../rtl)" $(BUILD_DIR)/rtl
 	cp replay_main.cpp replay_top.sv $(BUILD_DIR)/
-	cd $(BUILD_DIR) && verilator $(VFLAGS) -Irtl -I. --Mdir . \
+	cd $(BUILD_DIR) && verilator $(VFLAGS) $(GFLAGS) -Irtl -I. --Mdir . \
 	    $(RTL_NAMES) replay_top.sv --top $(TOP) replay_main.cpp -o $(BIN)
 
 run: $(BUILD_DIR)/$(BIN)
-	$(BUILD_DIR)/$(BIN) --in "$(IN)" --out "$(OUT)"
+	$(BUILD_DIR)/$(BIN) --in "$(IN)" --out "$(OUT)" --orders-out "$(ORDERS)"
 
 clean:
 	rm -rf obj_dir $(BUILD_DIR)

@@ -2,10 +2,12 @@
 #   make TOP=tb_itch_decoder run
 TOP ?= tb_itch_decoder
 
-# book_pkg.sv must be compiled first (it declares the package everything imports),
-# and must not be repeated by the wildcard -- a duplicate file triggers MODDUP.
-RTL := ../../rtl/book_pkg.sv \
-       $(filter-out ../../rtl/book_pkg.sv,$(wildcard ../../rtl/*.sv))
+# Packages must be compiled before anything that imports them, and trade_pkg
+# itself references book_pkg, so the order is book_pkg, trade_pkg, then the
+# rest. Neither may be repeated by the wildcard -- a duplicate file triggers
+# MODDUP.
+PKGS := ../../rtl/book_pkg.sv ../../rtl/trade_pkg.sv
+RTL  := $(PKGS) $(filter-out $(PKGS),$(wildcard ../../rtl/*.sv))
 
 # Waivers:
 #  UNUSEDSIGNAL - decode views intentionally ignore ITCH fields the book doesn't need.

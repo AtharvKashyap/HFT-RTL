@@ -1,12 +1,13 @@
 # hft-rtl — verification results
 
 Golden-model vs RTL replay. The Python model (`model/`) and the SystemVerilog
-pipeline (`rtl/`) consume a **byte-identical** input stream and their book
-snapshots are compared field by field; a single differing price or share count at
-any of the 16 tracked levels fails the run.
+pipeline (`rtl/`) consume a **byte-identical** input stream, and two things are
+compared: the book snapshots field by field (a single differing price or share
+count at any of the 16 tracked levels fails the run) and the OUCH order frames
+byte for byte.
 
-**Headline: 10,000,000 real Nasdaq ITCH messages, 260,053 book updates, 0
-mismatches.**
+**Headline: 10,000,000 real Nasdaq ITCH messages, 260,053 book updates and 798
+OUCH order frames, 0 mismatches.**
 
 ## How a run works
 
@@ -16,18 +17,24 @@ make replay-headline                   # the 10M run below
 ```
 
 1. `model/dump_trace.py` reads N messages from the capture, runs them through the
-   Python golden model, and writes both the golden trace (`golden_N.jsonl`, one
-   line per book update) and — via `--wrap-out` — the exact MoldUDP64 byte stream
-   it consumed (`stream_N.mold`). Both come out of the same loop, so they cannot
-   drift.
+   Python golden chain, and writes the golden trace (`golden_N.jsonl`, one line
+   per book update), the golden order stream (`golden_orders_N.jsonl`, one line
+   per accepted and encoded order) and — via `--wrap-out` — the exact MoldUDP64
+   byte stream it consumed (`stream_N.mold`). All three come out of the same
+   loop, so they cannot drift.
 2. `tb/replay` (Verilator `--cc -O3`) feeds that same byte stream into
-   `itch_book_top` one byte per cycle, honouring `in_ready`, and writes
-   `rtl_N.jsonl` on every `upd_valid`.
-3. `model/compare_traces.py` compares the two traces line for line, ignoring only
-   the RTL-only `lat` field (cycles from message boundary to update — the sole
-   hardware-only value in the trace; neither producer emits a timestamp).
+   `tick_to_trade_top` one byte per cycle, honouring `in_ready`, and writes
+   `rtl_N.jsonl` on every `upd_valid` and `rtl_orders_N.jsonl` on every
+   completed OUCH frame.
+3. `model/compare_traces.py` compares the two book traces line for line, ignoring
+   only the RTL-only `lat` field (cycles from message boundary to update — the
+   sole hardware-only value in the trace; neither producer emits a timestamp).
    Message ordinal `n`, symbol index, and all 8 bid + 8 ask (price, shares) pairs
    must match exactly, and the two update sequences must line up 1:1.
+4. `model/compare_orders.py` compares the two order streams: ordinal `n` and the
+   51-byte OUCH frame, byte for byte, 1:1. `run_replay.sh` then asserts the DUT's
+   strategy/risk counters against the golden model's own summary — see
+   [Tick-to-trade](#tick-to-trade).
 
 Non-vacuity: "0 mismatches" is only meaningful if something was actually
 compared, so every line is shape-checked before comparison (the four contract
@@ -36,14 +43,20 @@ degenerate stubs cannot match each other), and `run_replay.sh` passes
 `--min-updates` to the comparator: 1 by default, 100 for `--limit ≥ 1,000,000`.
 A run that matched fewer updates than that exits 1 with a `VACUOUS:` message.
 The 10k rung is the one legitimate exception (see below) and needs an explicit
-`--min-updates 0`.
+`--min-updates 0`. The order comparator has the same gate under the name
+`--min-orders`, defaulting to 20 at `--limit ≥ 1,000,000` and 0 below it: the
+strategy is selective enough (hundreds of orders per 10M messages) that a small
+rung can legitimately send nothing, while the large rungs measure 62 orders at
+1M and 798 at 10M — so a floor of 20 sits comfortably under the real counts but
+still fails a run whose order path collapsed to a handful of frames.
 
 Ordinal alignment: `n` is the index over **all** messages read from the capture
 (parsed or not, tracked or not). In the RTL that ordinal is derived from the DUT's
 `msg_boundary` pulse, so `n` is compared as data — a one-message skew in either
 direction is a hard failure, not a silently absorbed offset. The harness also
 counts updates arriving before any message boundary (`orphan updates`, 0 in every
-run) as an independent check that the two numbering schemes start together.
+run) as an independent check that the two numbering schemes start together, and
+the same check for order frames (`orphan orders`, likewise 0 in every run).
 
 ## Data provenance
 
@@ -132,6 +145,9 @@ Deterministic and tightly bounded: 4 cycles in the common case, never worse than
 over 260k updates. The tail comes from REPLACE (two order-table operations) and
 from linear-probe depth on a table lookup.
 
+This is the book half of the path. For boundary → first OUCH byte, see
+[Tick-to-trade latency](#tick-to-trade-latency).
+
 ## Counters (10M run)
 
 | Counter | Value | Meaning |
@@ -172,6 +188,163 @@ linear probing piles them into contiguous runs, so extra address bits (which
 spread the runs out) are the effective lever, not a bigger probe window. See the
 comment in `rtl/book_pkg.sv`.
 
+## Tick-to-trade
+
+The replay DUT is `tick_to_trade_top`: pure wiring around
+`itch_book_top` → `strategy_imbalance` → `risk_gate` → `ouch_encoder`. Bytes go
+in, OUCH 4.2 Enter Order frames come out. The book stage's outputs are still
+exposed unchanged, which is why the book comparison above is unaffected — the
+10M tick-to-trade run reproduces the phase-1 book numbers exactly (260,053
+updates, 356,357,526 cycles, 0 mismatches).
+
+The chain, one stage per cycle after the book update:
+
+1. **`strategy_imbalance`** — per symbol, weighted masses `B = Σ bid_shares[i]>>i`
+   and `A = Σ ask_shares[i]>>i` over the 8 levels; state is LONG iff
+   `B > A<<THRESH_LOG2`, SHORT iff `A > B<<THRESH_LOG2`, else NEUTRAL. An intent
+   fires only on the *edge* into LONG (buy at `ask_price[0]`) or into SHORT (sell
+   at `bid_price[0]`); staying never fires, and after firing that symbol is muted
+   for `COOLDOWN_UPDATES` of its own updates while the state machine keeps
+   running.
+2. **`risk_gate`** — four checks in a fixed order, exactly one reject counter per
+   rejection (the first check that fails): sanity (`bid0 != 0 && ask0 != 0 &&
+   bid0 < ask0`), collar (`|price − mid| > mid>>COLLAR_SHIFT`), rate (fewer than
+   `MIN_ORDER_SPACING` book updates since the last *accepted* order), position
+   (post-trade `|pos[symbol]|` would exceed `MAX_POSITION`).
+3. **`ouch_encoder`** — serializes an accepted intent into the 51-byte wire frame
+   (2-byte big-endian length + 49-byte Enter Order body) one byte per cycle,
+   through a depth-4 FIFO that absorbs bursts.
+
+**Rate-counter coincidence semantics.** The risk gate's rate check counts book
+updates, and in the RTL a book update (`upd_valid`) can land on the very cycle
+an intent is being judged — a case the sequential golden model, which handles
+one event at a time, has no direct analogue for. The rule is that the RTL
+matches the model *by construction*, not by coincidence of tuning: the model
+counts update *k* and then judges the intent update *k* produced, and the RTL
+gets exactly that from the strategy's 1-cycle intent register — update *k* was
+already counted on the previous edge by the time its intent arrives. A
+`upd_valid` coincident with the intent is therefore a **later** book event
+(*k+1*), one the model has not reached yet, so it is *not* folded into the
+comparison: the intent is judged against the pre-coincident count, and after an
+accept (which clears the count) that coincident update survives the reset as a
+count of 1, exactly as the model's next iteration would count it. Both halves
+matter and they err in opposite directions — an earlier "increment the count
+before comparing" formulation was simultaneously one too high at the compare
+and one too low after an accept. It happened to produce identical results on
+this capture because no coincident intent ever sat on the rate boundary, which
+is precisely why the equivalence is now argued from the wiring rather than
+inferred from a matching run. `tb/unit/tb_risk_gate.sv` pins both halves with
+directed cases (a coincident update on an accepted intent must leave the count
+at 1; a coincident update on an intent whose pre-coincident count is
+`MIN_ORDER_SPACING − 1` must still rate-reject).
+
+### Parameters
+
+Tuned on this capture; every default held, so the headline run passes no
+overrides. They are fed from a single place in `scripts/run_replay.sh` to both
+sides — as flags to `model/dump_trace.py` and as `verilator -G` overrides to the
+harness build — so the two can never be tuned apart.
+
+| Parameter | Value | Effect |
+|---|---|---|
+| `THRESH_LOG2` | 2 | one side's weighted mass must exceed 4× the other |
+| `COOLDOWN_UPDATES` | 16 | per-symbol mute after firing, in that symbol's updates |
+| `ORDER_SHARES` | 100 | shares per order |
+| `MAX_POSITION` | 1000 | max absolute signed position per symbol (10 orders' worth) |
+| `MIN_ORDER_SPACING` | 10 | book updates (any symbol) between accepted orders |
+| `COLLAR_SHIFT` | 3 | order price must be within mid/8 of mid |
+
+### Order stream — 10,000,000 messages
+
+| Metric | Value |
+|---|---|
+| Strategy intents | 1,827 |
+| Risk-gate accepts | 798 |
+| OUCH frames on the wire | 798 (40,698 bytes) |
+| **Order mismatches vs golden model** | **0** |
+| Orphan orders / truncated frames | 0 / 0 |
+| `fifo_drop_count` | 0 |
+| Sim wall time (whole pipeline) | 236.97 s, 42,200 msgs/sec |
+
+The two 10M-message wall-clock figures in this document (298.12 s in the
+headline run above, 236.97 s here) are separate measurements taken at
+different times, not a regression in either direction — the cycle counts they
+correspond to (356,357,526) are identical, so the wall-time gap is machine
+load variance between runs, not a change in what got simulated.
+
+Reject breakdown of the 1,029 intents that did not become orders:
+
+| Check | Rejects | Reading |
+|---|---|---|
+| sanity | 0 | the book never presented a crossed or one-sided top of book to a firing intent |
+| collar | 0 | the strategy prices at top of book, i.e. half a spread from mid; on these 8 liquid symbols no firing intent ever saw a spread wider than mid/4, so the collar never bound |
+| rate | 40 | intents arriving within 10 book updates of the previous accepted order |
+| position | 989 | the dominant limiter — the position cap, not the market, is what stops this strategy |
+
+The counters are compared, not just the wire: `run_replay.sh` asserts each of
+`intent_count`, `accept_count`, the four reject counters and `order_count`
+against the golden model's own summary line. That catches a divergence the order
+stream alone would miss — two implementations that reject *different* intents for
+*different* reasons can still emit the same frames if the difference happens not
+to change which orders survive.
+
+`raw` is compared byte for byte, and the frame contains the order token
+(`HFTRTL` + 8 hex digits of a free-running counter). So the comparison is
+stricter than "same orders": the RTL's counter and the model's must stay in
+lockstep, which they can only do if both accepted exactly the same intents in
+exactly the same sequence.
+
+`fifo_drop_count == 0` matters because the encoder's input FIFO is only 4 deep
+and a drop there would silently remove an accepted order from the wire. At
+`MIN_ORDER_SPACING = 10` the gate cannot accept two orders closer than 10 book
+updates apart, and a frame takes 51 cycles, so the FIFO is never under pressure
+on this workload — the depth-4 slack is a consequence of that parameter, not a
+bound that binds, and at `--min-spacing 1` drops become reachable. Either way
+the harness fails the run if `fifo_drop_count` is ever nonzero, rather than
+letting the order stream quietly shorten.
+
+### Tick-to-trade latency
+
+Cycles from the DUT's `msg_boundary` pulse (last byte of the framed ITCH message
+that caused the order) to `frame_start` (first byte of the OUCH frame on the
+wire). Same convention as the book-update `lat` above: it excludes the 1
+byte/cycle shift-in on the way in and the 51-cycle shift-out on the way out, both
+of which are datapath-width properties rather than pipeline properties.
+
+| Run | Orders | min | median | p99 | max |
+|---|---|---|---|---|---|
+| 300,000 msgs | 20 | 8 | 8 | 8 | 8 |
+| 1,000,000 msgs | 62 | 8 | 8 | 8 | 8 |
+| 10,000,000 msgs | 798 | 8 | 8 | 9 | 9 |
+
+8 cycles is the structural floor and the overwhelmingly common case: 4 cycles of
+book update (decode → order table → price book), 1 for the strategy, 1 for the
+risk gate, and 2 in the encoder (the accepted intent is pushed into the FIFO,
+then popped onto the wire as byte 0, which is the cycle `frame_start` pulses). The
+trade stages add a fixed 4, so a 9-cycle order must come from a book update that
+itself took 5 — the same probe-depth/REPLACE tail the book-update latency table
+shows. Nothing in the trade stages is data-dependent in time; the whole spread
+in this table is inherited from the book.
+
+### Scope caveats
+
+**Position is sent-exposure, not inventory.** There is no execution feedback
+path: `risk_gate` adds `±ORDER_SHARES` to a symbol's position when it *accepts*
+an order, and nothing ever removes it. Orders that would be rejected, cancelled,
+or partially filled by a real venue are all counted as fully filled here. The
+989 position rejects above are therefore rejects against orders *sent*, not
+against shares *owned*, and the position cap is reached faster than it would be
+against a venue that filled only some of them.
+
+**OUCH only, no session layer.** The encoder emits bare OUCH 4.2 Enter Order
+frames with their 2-byte length prefix. There is no SoupBinTCP session — no
+login, no sequenced-data wrapper, no heartbeats, no server-side Accepted/Rejected
+or Executed messages coming back, and hence no order-state tracking, no cancel
+or replace path, and no reconciliation of what the venue thinks against what the
+gate thinks. The verified claim is exactly "the correct Enter Order bytes, in the
+correct order, N cycles after the tick that caused them" — everything a real
+order entry gateway does after that is out of scope.
+
 ## Fuzz robustness
 
 `model/fuzz_stream.py` builds a seeded, corrupted MoldUDP64 byte stream: a
@@ -181,7 +354,9 @@ length prefix always matches its own actual bytes — see the module docstring
 for why that matters), truncated to a random whole number of surviving
 packets, followed by a **clean tail of 1,000 valid messages under a fresh
 MoldUDP64 session**. `tb/replay/replay_main.cpp --fuzz --tail-start <N>` runs
-that stream against `itch_book_top`.
+that stream against `tick_to_trade_top` (the book stage is what the corruption
+reaches; the trade stages downstream of it are along for the ride, and
+`orphan orders` is checked to be 0 in fuzz mode too).
 
 **What this actually proves: liveness under corruption, and nothing stronger.**
 The three pass criteria are exactly three liveness properties —
@@ -239,28 +414,34 @@ Left as-is.
 
 ## Unit tests
 
-- `python3 -m pytest -q` — 58 passed (golden model, ITCH parsing, BinaryFILE
-  reader, MoldUDP64 wrapper, `--wrap-out` byte-identity, trace comparator
-  including its shape check and `--min-updates` non-vacuity gate, fuzz-stream
-  corruption/tail-integrity).
+- `python3 -m pytest -q` — 95 passed (golden model, ITCH parsing, BinaryFILE
+  reader, MoldUDP64 wrapper, `--wrap-out` byte-identity, the strategy, risk gate
+  and OUCH encoder, `dump_trace --orders-out`, both comparators including their
+  shape checks and non-vacuity gates, fuzz-stream corruption/tail-integrity).
 - `make -C tb/unit TOP=<tb> run` for `tb_mold_framer`, `tb_itch_decoder`,
-  `tb_price_book`, `tb_book_router`, `tb_itch_book_top` — all pass.
+  `tb_price_book`, `tb_book_router`, `tb_itch_book_top`,
+  `tb_strategy_imbalance`, `tb_risk_gate`, `tb_ouch_encoder`,
+  `tb_tick_to_trade_top` — all pass.
 
-Functional coverage is tallied by hand in the two random-stimulus TBs (Verilator
-does not implement covergroups) and gated: `tb_price_book` requires all 14 bins
-of {ADD-new-level, ADD-aggregate, ADD-evict-9th, ADD-reject-full,
-REDUCE-partial, REDUCE-remove, REDUCE-miss} × {bid, ask} to be hit, and
-`tb_book_router` all 10 bins of {ADD, EXEC, CANCEL, DELETE, REPLACE} ×
-{hit, miss} (for ADD: tracked / untracked). An empty bin is a `$fatal`, not a
-warning.
+Functional coverage is tallied by hand in the five random-stimulus TBs
+(Verilator does not implement covergroups) and gated — an empty bin is a
+`$fatal`, not a warning:
+
+| TB | Bins | What must be hit |
+|---|---|---|
+| `tb_price_book` | 14 | {ADD-new-level, ADD-aggregate, ADD-evict-9th, ADD-reject-full, REDUCE-partial, REDUCE-remove, REDUCE-miss} × {bid, ask} |
+| `tb_book_router` | 10 | {ADD, EXEC, CANCEL, DELETE, REPLACE} × {hit, miss} (for ADD: tracked / untracked) |
+| `tb_strategy_imbalance` | 6 | fire-buy, fire-sell, suppress-cooldown, suppress-same-state, neutral-rearm, empty-side-suppress |
+| `tb_risk_gate` | 5 | accept plus each of the four reject paths (sanity, collar, rate, position) |
+| `tb_ouch_encoder` | 4 | side-B, side-S, queued-while-busy, immediate |
 
 ## Reproducing
 
 ```
 scripts/download_data.sh              # ~3.5 GB
 make test-model
-make replay LIMIT=1000000             # ~30 s sim
-make replay-headline                  # 10M messages, ~5 min sim
+make replay LIMIT=1000000             # ~25 s sim
+make replay-headline                  # 10M messages, ~4 min sim
 
 # Fuzz robustness (3 seeds), see "Fuzz robustness" above:
 BIN="$(make -C tb/replay -s print-bin)"
