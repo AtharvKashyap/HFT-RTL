@@ -14,15 +14,29 @@
 //
 // Queueing: risk_gate can present accepted intents faster than one every 51
 // cycles, so a depth-4 FIFO absorbs bursts. in_valid presented while the
-// FIFO already holds 4 entries is a drop (fifo_drop_count++); this is meant
-// to be caught by the caller sizing its burst tolerance, not to happen in
-// normal operation, hence the simulation-only assertion below.
+// FIFO already holds 4 entries and nothing pops this edge is a drop
+// (fifo_drop_count++); this is meant to be caught by the caller sizing its
+// burst tolerance, not to happen in normal operation, hence the
+// simulation-only assertion below.
+//
+// Why depth 4 is enough here, explicitly: risk_gate accepts at most one
+// intent per MIN_ORDER_SPACING book updates, and each book update is itself
+// many cycles apart (the book is fed one byte per cycle and an ITCH message
+// is tens of bytes). At the default MIN_ORDER_SPACING = 10 the spacing
+// between accepted orders is therefore far greater than the 51 cycles a
+// frame takes to shift out, so the FIFO never holds more than one entry and
+// the depth is slack, not a bound that binds. That slack is a function of the
+// parameter, not a property of the encoder: running the replay at
+// `--min-spacing 1` removes the spacing guarantee entirely and makes drops
+// reachable. They are then counted in fifo_drop_count, which
+// scripts/run_replay.sh asserts is 0 -- so a configuration that overruns this
+// FIFO fails the run rather than silently shortening the order stream.
 //
 // Serializer/FIFO handoff: the FIFO's occupancy (count_q) and read/write
 // pointers are read at their pre-edge (current) values to decide both this
-// cycle's push (in_valid && count_q < 4) and this cycle's pop, so a push and
-// a pop on the same edge are independent and both land via the same
-// nonblocking update. A pop happens either when the serializer is idle and
+// cycle's push (in_valid && a slot is free, counting one freed by this
+// cycle's own pop) and this cycle's pop, so a push and a pop on the same edge
+// are independent and both land via the same nonblocking update. A pop happens either when the serializer is idle and
 // the queue is non-empty, or -- for back-to-back throughput with no idle
 // gap -- on the very edge that finishes a frame (byte_idx_q == 50) if the
 // queue is already non-empty at that point. The frame's fields (side,
@@ -64,9 +78,14 @@ module ouch_encoder #(
   logic [31:0]   cur_token_q;
 
   logic push_ok, pop_ok;
-  assign push_ok = in_valid && (count_q < (PTR_W+1)'(FIFO_DEPTH));
   assign pop_ok  = (count_q > '0) &&
                     ((state_q == ST_IDLE) || (state_q == ST_SEND && byte_idx_q == 6'd50));
+  // A full FIFO still accepts a push on an edge that also pops: the pop frees
+  // its slot on the same edge, and because both the pop's read of
+  // queue_mem[rd_ptr_q] and the push's write to queue_mem[wr_ptr_q] (the same
+  // slot when full) are nonblocking, the pop takes the old entry while the
+  // push installs the new one. Occupancy is unchanged, so nothing is lost.
+  assign push_ok = in_valid && ((count_q < (PTR_W+1)'(FIFO_DEPTH)) || pop_ok);
 
   assign out_valid   = (state_q == ST_SEND);
   assign out_last    = out_valid && (byte_idx_q == 6'd50);
