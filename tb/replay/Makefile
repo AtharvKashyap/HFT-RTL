@@ -16,12 +16,13 @@ SYMBOLS ?= AAPL,MSFT,SPY,QQQ,TSLA,NVDA,AMD,INTC
 TOP := replay_top
 BIN := replay
 
-# book_pkg.sv must come first (it declares the package everything imports) and
-# must not be repeated by the wildcard -- a duplicate file triggers MODDUP.
+# Packages must come before anything that imports them, and trade_pkg itself
+# references book_pkg, so the order is book_pkg, trade_pkg, then the rest.
+# Neither may be repeated by the wildcard -- a duplicate file triggers MODDUP.
 # RTL is the prerequisite list (relative to this directory); RTL_NAMES is the
 # same set as bare filenames, used inside the build directory (see below).
-RTL := ../../rtl/book_pkg.sv \
-       $(filter-out ../../rtl/book_pkg.sv,$(wildcard ../../rtl/*.sv))
+PKGS := ../../rtl/book_pkg.sv ../../rtl/trade_pkg.sv
+RTL  := $(PKGS) $(filter-out $(PKGS),$(wildcard ../../rtl/*.sv))
 RTL_NAMES := $(addprefix rtl/,$(notdir $(RTL)))
 
 # Neither verilator nor the makefile it generates can cope with a source path
