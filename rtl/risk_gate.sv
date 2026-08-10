@@ -20,21 +20,28 @@
 // Coincidence rule (upd_valid and in_valid on the same cycle): upd_valid is
 // the book's update pulse -- the rate time base -- and is a separate input
 // from in_valid, which presents an intent one cycle after the upstream
-// strategy's triggering update. Because of that 1-cycle intent delay, the
-// update that immediately follows an intent's triggering update can already
-// be in flight by the time the intent itself is judged. The contract's
-// resolution: the rate counter's increment for the coincident upd_valid is
-// applied BEFORE the rate comparison for that same cycle's in_valid, i.e. an
-// intent is judged against the incremented count. This is exactly the model
-// wiring rule in model/dump_trace.py (on_update() called before on_intent()
-// for the same event) -- calling on_update() first means the Python counter
-// the intent sees has already been bumped, which is what letting the
-// increment land before the comparison reproduces here. Both sides of the
-// equivalence live in one always_ff below: the unconditional
-// `if (upd_valid) rate_q <= ...`
-// runs first in program order, and the combinational `rate_eff` used by the
-// checks already reflects that same increment when upd_valid is high this
-// cycle.
+// strategy's triggering update.
+//
+// The golden model (model/dump_trace.py) processes ONE event at a time: for
+// event k it calls on_update() and only then feeds the strategy's intent for
+// that same event k through on_intent(). So the intent triggered by update k
+// is judged against a count that already includes update k -- and the RTL
+// gets exactly that for free from the strategy's 1-cycle intent register: by
+// the time the intent arrives, update k's own upd_valid pulse has already
+// been counted on the previous edge. Equivalence is by construction, with no
+// fold-in needed.
+//
+// What a coincident upd_valid on the intent's cycle represents is therefore a
+// DIFFERENT, LATER event (k+1) -- one the model has not reached yet when it
+// judges k's intent. It must NOT be folded into the comparison:
+//   * `rate_eff = rate_q` -- the intent is judged against the PRE-coincident
+//     count, matching the model's ordering.
+//   * on accept, `rate_q <= upd_valid ? RATE_ONE : '0` -- the model resets
+//     updates_since_accept to 0 for event k and then counts event k+1 on the
+//     next iteration, so the coincident update survives the reset as a count
+//     of 1 rather than being discarded.
+// Both off-by-ones point in opposite directions, so the old "increment before
+// compare" fold was wrong on both sides at once.
 module risk_gate #(
   parameter int MAX_POSITION      = trade_pkg::MAX_POSITION_DEF,
   parameter int MIN_ORDER_SPACING = trade_pkg::MIN_ORDER_SPACING_DEF,
@@ -45,7 +52,7 @@ module risk_gate #(
   input  trade_pkg::gated_intent_t in,
   input  logic                     in_valid,
   output trade_pkg::order_intent_t out,
-  output logic                     out_valid, // 1-cycle pulse, cycle after in_valid
+  output logic                     out_valid, // 1-cycle pulse, cycle after an ACCEPTED in_valid
   output logic [31:0] accept_count, sanity_reject_count, collar_reject_count,
                       rate_reject_count, pos_reject_count
 );
@@ -63,13 +70,20 @@ module risk_gate #(
   logic signed [34:0] pos_q [NUM_SYMBOLS];
   logic [RATE_W-1:0]  rate_q;
 
+  // The post-accept value of the counter when an update coincides with the
+  // accepted intent: 1, i.e. that later update counted afresh. Degenerates to
+  // 0 when MIN_ORDER_SPACING is 0, where the counter saturates at 0 and the
+  // rate check never binds.
+  localparam logic [RATE_W-1:0] RATE_ONE = (MIN_ORDER_SPACING < 1) ? RATE_W'(0) : RATE_W'(1);
+
   logic [RATE_W-1:0] rate_next;
   assign rate_next = (rate_q >= RATE_W'(MIN_ORDER_SPACING)) ? rate_q : (rate_q + RATE_W'(1));
 
-  // Effective rate count used for the comparison this cycle: the coincidence
-  // rule folds a same-cycle upd_valid's increment in before the compare.
+  // Effective rate count used for the comparison this cycle: the PRE-coincident
+  // count. A same-cycle upd_valid is a later event than the intent being
+  // judged (see the coincidence rule in the header) and is not folded in.
   logic [RATE_W-1:0] rate_eff;
-  assign rate_eff = upd_valid ? rate_next : rate_q;
+  assign rate_eff = rate_q;
 
   // -------------------------------------------------------------- sanity
   logic sane;
@@ -146,7 +160,9 @@ module risk_gate #(
       if (in_valid) begin
         if (accept) begin
           pos_q[idx]   <= new_pos[34:0];
-          rate_q       <= '0;   // overrides the upd_valid increment above
+          // Overrides the upd_valid increment above: the accept clears the
+          // count, but a coincident (later-event) update still counts as 1.
+          rate_q       <= upd_valid ? RATE_ONE : '0;
           accept_count <= accept_count + 32'd1;
           out          <= in.intent;
           out_valid    <= 1'b1;

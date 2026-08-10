@@ -14,6 +14,14 @@ the counter for the FIRST failing check:
 4. position: signed pos[symbol] += (+shares if buy else -shares), applied
    only on accept; reject if the post-trade |pos| would exceed
    max_position.
+
+Event ordering (the reference the RTL is matched against): callers drive one
+book event at a time -- on_update() for event k, then on_intent() for the
+intent that event k produced (see model/dump_trace.py). So an intent is always
+judged against a count that includes its OWN triggering update and nothing
+later, and an accept's reset to 0 is followed by the NEXT event's on_update()
+counting as 1. rtl/risk_gate.sv reproduces both halves of that ordering; see
+its header for how.
 """
 
 

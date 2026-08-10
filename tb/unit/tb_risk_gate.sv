@@ -17,18 +17,20 @@
 // random book updates (the rate time base) driving a scoreboard that is an
 // independent re-implementation of model/risk.py's bookkeeping (not a copy
 // of the RTL's counters), including deliberate coincidences of an update and
-// an intent on the same cycle to exercise the "increment before compare"
-// rule documented in rtl/risk_gate.sv.
+// an intent on the same cycle to exercise the coincidence rule documented in
+// rtl/risk_gate.sv.
 //
 // Timing contract under test: upd_valid is the book's update pulse (the rate
 // time base) and is a separate input from in_valid. in_valid presented on a
-// rising edge is judged that edge (against pos/rate state already updated by
-// any upd_valid on the SAME edge -- the rate counter increments before the
-// comparison when both coincide); out and a one-cycle out_valid pulse appear
-// on the outputs immediately after (i.e. during the following cycle), and
-// only for accepted intents. All five counters update on the same edge that
-// judges in_valid, so they too become visible one cycle later, in step with
-// out_valid.
+// rising edge is judged that edge against the rate count as it stood BEFORE
+// any upd_valid on the same edge -- a coincident update is a later book event
+// than the one that produced this intent (the intent arrives one cycle behind
+// its own triggering update), so it is not folded into the comparison; it is
+// applied afterwards, and survives an accept's reset as a count of 1. out and
+// a one-cycle out_valid pulse appear on the outputs immediately after (i.e.
+// during the following cycle), and only for accepted intents. All five
+// counters update on the same edge that judges in_valid, so they too become
+// visible one cycle later, in step with out_valid.
 //
 // Timescale comes from the Makefile (--timescale 1ns/1ps).
 
@@ -157,10 +159,13 @@ module tb_risk_gate;
 
   // Drives one cycle: upd_p pulses upd_valid, and when in_p is set also
   // drives an intent on `in`/in_valid. When both pulse on the same cycle the
-  // scoreboard applies sb_on_update() before sb_on_intent(), exactly
-  // replicating the RTL's "increment before compare" coincidence rule (see
-  // rtl/risk_gate.sv). Entered and left on a falling edge so calls issue back
-  // to back with no idle gap.
+  // scoreboard applies sb_on_intent() FIRST and sb_on_update() after: the
+  // coincident update is a later book event than the one this intent came
+  // from, so the intent is judged against the pre-coincident count, and after
+  // an accept (which zeroes the count) that later update is counted as 1.
+  // This is the model's own per-event ordering, not a transcription of the
+  // RTL (see rtl/risk_gate.sv and model/risk.py). Entered and left on a
+  // falling edge so calls issue back to back with no idle gap.
   task automatic step(bit upd_p, bit in_p, int idx, bit side, int shares,
                       int price, int bid0, int ask0, string name);
     bit exp_accept;
@@ -178,7 +183,6 @@ module tb_risk_gate;
       in.ask0              = 32'(ask0);
     end
 
-    if (upd_p) sb_on_update();
     if (in_p) begin
       exp_accept = sb_on_intent(idx, side, shares, price, bid0, ask0);
       exp_idx    = idx;
@@ -190,6 +194,9 @@ module tb_risk_gate;
         else if (sb_sanity_last())    cov_bin[int'(COV_SANITY)]++;
       end
     end
+    // The coincident update lands after the intent has been judged, so it
+    // survives an accept's reset (leaving the count at 1, not 0).
+    if (upd_p) sb_on_update();
     op_num++;
 
     @(posedge clk);
@@ -376,14 +383,39 @@ module tb_risk_gate;
     // updates accrued from the earlier warmup to accept now.
     step(1'b0, 1'b1, 0, 1'b1, 100, 1010, 1000, 1010, "noeffect: rate untouched, now accepts");
 
-    // Directed coincidence case: an update and an intent on the same cycle.
-    // The rate counter increments before the comparison, so an intent that
-    // would otherwise be one update short of MIN_ORDER_SPACING passes when
-    // the coincident update supplies the last increment.
+    // Directed coincidence case (i): an update coincident with an ACCEPTED
+    // intent is a later book event, so it must survive the accept's reset --
+    // the count ends at 1, not 0. Probed by how many further updates it then
+    // takes to reach MIN_ORDER_SPACING again: MIN_ORDER_SPACING-2 more is one
+    // short (rate-reject), one more after that accepts.
     do_reset();
-    warm(MIN_ORDER_SPACING - 1, "coincide: warm one short");
+    warm(MIN_ORDER_SPACING, "coincide-accept: warm");
     step(1'b1, 1'b1, 0, 1'b1, 100, 1010, 1000, 1010,
-         "coincide: coincident update supplies the last increment, accepts");
+         "coincide-accept: accepts, coincident update survives the reset");
+    if (sb_rate !== 1)
+      $fatal(1, "coincide-accept: expected rate counter 1 after accept, got %0d", sb_rate);
+    warm(MIN_ORDER_SPACING - 2, "coincide-accept: warm one short");
+    step(1'b0, 1'b1, 0, 1'b1, 100, 1010, 1000, 1010,
+         "coincide-accept: one update short, rate-rejects");
+    if (sb_rate_rej !== 1)
+      $fatal(1, "coincide-accept: expected exactly 1 rate reject, got %0d", sb_rate_rej);
+    warm(1, "coincide-accept: last update");
+    step(1'b0, 1'b1, 0, 1'b1, 100, 1010, 1000, 1010,
+         "coincide-accept: threshold reached, accepts");
+
+    // Directed coincidence case (ii): the pre-coincident count is exactly
+    // MIN_ORDER_SPACING-1 and an update coincides with the intent. The
+    // coincident update belongs to a LATER event and must not be folded into
+    // the comparison, so this rate-rejects. (The old "increment before
+    // compare" rule accepted it.)
+    do_reset();
+    warm(MIN_ORDER_SPACING - 1, "coincide-reject: warm one short");
+    step(1'b1, 1'b1, 0, 1'b1, 100, 1010, 1000, 1010,
+         "coincide-reject: coincident update is a later event, rate-rejects");
+    if (sb_rate_rej !== 1)
+      $fatal(1, "coincide-reject: expected a rate reject, got %0d", sb_rate_rej);
+    if (sb_accept !== 0)
+      $fatal(1, "coincide-reject: intent should not have been accepted");
 
     $display("  directed cases: ok (%0d ops)", op_num);
 
