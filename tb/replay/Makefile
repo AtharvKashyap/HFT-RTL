@@ -56,11 +56,28 @@ GEN_HDR   := $(BUILD_DIR)/replay_symbols.svh
 # Configuration stamp. SYMBOLS and the -G parameters are baked in at verilate
 # time but arrive on the make command line, which changes no file's timestamp
 # -- so without this, `make SYMBOLS=AAPL` after a default build would happily
-# reuse the previous binary and silently verify the wrong configuration. The
-# stamp file holds the current configuration string and is rewritten only when
-# it actually changes, so it triggers a rebuild exactly when one is needed.
+# reuse the previous binary and silently verify the wrong configuration. (Not a
+# hypothetical: building at -GTHRESH_LOG2=3 and then rebuilding at the default
+# kept the 3 binary, and the 300k replay failed with 15 intents instead of 22.)
+#
+# The check runs at PARSE time, via $(shell ...), and works by DELETING the
+# generated header and the binary when the configuration string has changed.
+# Both details are load-bearing. A normal target whose recipe rewrites a stamp
+# file does not work here: make 3.81 (the system make on macOS) stats a target
+# before remaking its prerequisites and does not re-stat afterwards, so a stamp
+# rewritten -- or an output deleted -- during the same invocation is noticed
+# only on the NEXT one. Deleting before any target is considered cannot be
+# missed.
 CONFIG := SYMBOLS=$(SYMBOLS) $(GFLAGS)
 STAMP  := $(BUILD_DIR)/.build_config
+
+ifeq (,$(filter clean,$(MAKECMDGOALS)))
+_stamp_check := $(shell mkdir -p $(BUILD_DIR); \
+  printf '%s\n' '$(CONFIG)' | cmp -s - $(STAMP) || { \
+    printf '%s\n' '$(CONFIG)' > $(STAMP); \
+    rm -f $(GEN_HDR) $(BUILD_DIR)/$(BIN); \
+  })
+endif
 
 # Waivers match tb/unit/Makefile:
 #  UNUSEDSIGNAL - decode views intentionally ignore ITCH fields the book doesn't need.
@@ -91,7 +108,7 @@ IN     ?= /tmp/fpga_proj_vbuild/stream.mold
 OUT    ?= /tmp/fpga_proj_vbuild/rtl.jsonl
 ORDERS ?= /tmp/fpga_proj_vbuild/rtl_orders.jsonl
 
-.PHONY: all run print-bin clean force
+.PHONY: all run print-bin clean
 
 all: $(BUILD_DIR)/$(BIN)
 
@@ -101,15 +118,11 @@ all: $(BUILD_DIR)/$(BIN)
 print-bin:
 	@echo $(BUILD_DIR)/$(BIN)
 
-$(STAMP): force
-	@mkdir -p $(BUILD_DIR)
-	@printf '%s\n' '$(CONFIG)' | cmp -s - $@ || printf '%s\n' '$(CONFIG)' > $@
-
-$(GEN_HDR): ../../scripts/gen_symbols.py Makefile $(STAMP)
+$(GEN_HDR): ../../scripts/gen_symbols.py Makefile
 	mkdir -p $(BUILD_DIR)
 	python3 ../../scripts/gen_symbols.py '$(SYMBOLS)' > $@
 
-$(BUILD_DIR)/$(BIN): $(GEN_HDR) $(STAMP) replay_top.sv replay_main.cpp $(RTL)
+$(BUILD_DIR)/$(BIN): $(GEN_HDR) replay_top.sv replay_main.cpp $(RTL)
 	mkdir -p $(BUILD_DIR)
 	ln -sfn "$(abspath ../../rtl)" $(BUILD_DIR)/rtl
 	cp replay_main.cpp replay_top.sv $(BUILD_DIR)/
